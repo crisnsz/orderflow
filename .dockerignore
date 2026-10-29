@@ -1,0 +1,7 @@
+.git
+.github
+.env
+bin
+*.md
+!README.md
+docs

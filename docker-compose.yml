@@ -1,0 +1,124 @@
+name: orderflow
+
+x-service-env: &service-env
+  LOG_LEVEL: info
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  RABBITMQ_URL: amqp://orderflow:${RABBITMQ_PASSWORD:-orderflow-demo-password}@rabbitmq:5672/
+
+x-service: &service
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "/app/service", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: orderflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orderflow-demo-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U orderflow -d notifications"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  rabbitmq:
+    image: rabbitmq:4.1.4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: orderflow
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-orderflow-demo-password}
+    ports:
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+
+  inventory:
+    <<: *service
+    build: { context: ., args: { SERVICE: inventory } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://orderflow:${POSTGRES_PASSWORD:-orderflow-demo-password}@postgres:5432/inventory
+    depends_on:
+      postgres: { condition: service_healthy }
+      jaeger: { condition: service_started }
+
+  orders:
+    <<: *service
+    build: { context: ., args: { SERVICE: orders } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://orderflow:${POSTGRES_PASSWORD:-orderflow-demo-password}@postgres:5432/orders
+      INVENTORY_ADDR: inventory:9002
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+
+  billing:
+    <<: *service
+    build: { context: ., args: { SERVICE: billing } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://orderflow:${POSTGRES_PASSWORD:-orderflow-demo-password}@postgres:5432/billing
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  payments:
+    <<: *service
+    build: { context: ., args: { SERVICE: payments } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://orderflow:${POSTGRES_PASSWORD:-orderflow-demo-password}@postgres:5432/payments
+      PAYMENTS_FAIL_STAGE: ${PAYMENTS_FAIL_STAGE:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  notifications:
+    <<: *service
+    build: { context: ., args: { SERVICE: notifications } }
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://orderflow:${POSTGRES_PASSWORD:-orderflow-demo-password}@postgres:5432/notifications
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  gateway:
+    <<: *service
+    build: { context: ., args: { SERVICE: gateway } }
+    environment:
+      <<: *service-env
+      ORDERS_ADDR: orders:9001
+      INVENTORY_ADDR: inventory:9002
+      PAYMENTS_URL: http://payments:8083
+      SESSION_SECRET: ${SESSION_SECRET:-demo-only-not-a-real-secret-0000}
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      orders: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+      payments: { condition: service_healthy }
+
+volumes:
+  pgdata:

@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package orders.v1;
+
+option go_package = "github.com/crisnsz/orderflow/gen/orders/v1;ordersv1";
+
+service OrdersService {
+  rpc PlaceOrder(PlaceOrderRequest) returns (Order);
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+}
+
+message Item {
+  string sku = 1;
+  int32 quantity = 2;
+  int64 unit_price_cents = 3;
+}
+
+message Transition {
+  string from = 1;
+  string to = 2;
+  string trigger = 3;
+  string at = 4; // RFC 3339
+}
+
+message Order {
+  string id = 1;
+  string user_id = 2;
+  string state = 3;
+  int64 total_cents = 4;
+  string cancel_reason = 5;
+  repeated Item items = 6;
+  repeated Transition history = 7;
+  string created_at = 8;
+}
+
+message PlaceOrderRequest {
+  string user_id = 1;
+  repeated Item items = 2; // unit_price_cents is ignored; inventory is the price authority
+}
+
+message GetOrderRequest {
+  string id = 1;
+}
+
+message ListOrdersRequest {
+  string user_id = 1;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+}

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>orderflow demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>orderflow</h1>
+    <p class="sub">Event-driven order flow demo. Simulated login, simulated bank, simulated notifications.</p>
+    <div id="whoami" hidden><span id="who"></span> <button id="logout" class="link">log out</button></div>
+  </header>
+
+  <main>
+    <section id="login">
+      <h2>1. Pick a demo user</h2>
+      <p class="hint">There is no real authentication: choosing a user issues a signed session cookie.</p>
+      <div id="users" class="cards"></div>
+    </section>
+
+    <div id="app" hidden>
+      <section>
+        <h2>2. Your account</h2>
+        <div id="cards"></div>
+      </section>
+
+      <section>
+        <h2>3. Place an order</h2>
+        <table id="products">
+          <thead><tr><th>Product</th><th>Price</th><th>In stock</th><th>Qty</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <button id="place">Place order</button>
+        <span id="place-msg" class="hint" role="status"></span>
+      </section>
+
+      <section>
+        <h2>Payment failure switch</h2>
+        <p class="hint">Force the fake bank to fail so you can watch the saga compensate.</p>
+        <label>Failure stage
+          <select id="stage">
+            <option value="">off (payments succeed)</option>
+            <option value="auth">auth (authorization declined)</option>
+            <option value="sale">sale (capture fails, authorization voided)</option>
+          </select>
+        </label>
+        <button id="apply-stage">Apply</button>
+        <span id="stage-msg" class="hint" role="status"></span>
+      </section>
+
+      <section>
+        <h2>4. Live timeline <span id="state" class="chip" hidden></span></h2>
+        <p id="order-line" class="hint">Place an order to see its events arrive live.</p>
+        <ol id="timeline"></ol>
+      </section>
+
+      <section>
+        <h2>Your orders</h2>
+        <ul id="orders"></ul>
+      </section>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

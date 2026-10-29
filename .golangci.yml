@@ -1,0 +1,20 @@
+version: "2"
+run:
+  build-tags:
+    - integration
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - bodyclose
+    - misspell
+    - unconvert
+    - gocritic
+    - sloglint
+  settings:
+    sloglint:
+      context: scope
+      no-global: ""
+formatters:
+  enable:
+    - gofmt
