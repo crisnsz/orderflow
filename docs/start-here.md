@@ -5,9 +5,6 @@ click, what each tool is for, and why the system is built this way. It does not
 walk through the Go code. When you are ready for that, the last step is
 [walkthrough.md](walkthrough.md).
 
-Everything below was run against the real stack. Where a time or a count is
-given, it was measured, not guessed.
-
 - [1. What this project is](#1-what-this-project-is)
 - [2. The programs and what each is for](#2-the-programs-and-what-each-is-for)
 - [3. First run](#3-first-run)
@@ -16,7 +13,6 @@ given, it was measured, not guessed.
 - [6. Project structure](#6-project-structure)
 - [7. Architecture and the reasons behind it](#7-architecture-and-the-reasons-behind-it)
 - [8. How quality is checked](#8-how-quality-is-checked)
-- [9. Suggested path to learn it](#9-suggested-path-to-learn-it)
 
 ## 1. What this project is
 
@@ -221,8 +217,6 @@ database, with nobody going to move it: this is a known gap
 log `sms` for Bob.
 
 ### Scenario 3: payment fails, the saga compensates
-
-This is the one to rehearse for an interview.
 
 **Clicks**
 
@@ -550,7 +544,7 @@ running: consumers reconnect with backoff, the outbox relay keeps trying, and
 HTTP and gRPC keep answering. Reason: a messaging problem should delay work,
 not take the shop down. You saw it in scenario 6.
 
-**Limits worth saying out loud in an interview.** Compensation calls inventory
+**Known limits.** Compensation calls inventory
 inside a database transaction (ADR 20), which is fine here and wrong at high
 volume. A failed void after a declined sale is only logged (ADR 29). Manual
 payment is a dead end (ADR 24). Tracing samples everything and logs live only
@@ -580,28 +574,3 @@ every pull request:
 Not covered by any automated test: the browser page itself, a broker outage
 across the whole compose stack (the integration test covers `orders` only),
 and load behaviour.
-
-## 9. Suggested path to learn it
-
-**Sitting 1: see it work (about an hour).** Read section 1 and 2 here. Run
-`make up` and do scenarios 1 to 4 in section 4, with Jaeger and the logs open.
-Goal: be able to say what happens when you press Place order.
-
-**Sitting 2: see it break (about an hour).** Do scenarios 5 and 6. Read
-section 5 and 7 here, then [observability.md](observability.md) and
-[sse.md](sse.md). Goal: explain why a stopped service does not lose an order.
-
-**Sitting 3: the reasons.** Read the README diagrams (architecture, event flow,
-saga state machine), then [DECISIONS.md](../DECISIONS.md) ADRs 2 to 8, 20 and
-28. Goal: for each pattern, state the problem it solves and its cost.
-
-**Sitting 4: the demo detail.** Read [demo-guide.md](demo-guide.md), especially
-the RabbitMQ part (section 4), and run `make test` and `make test-integration`.
-
-**Sitting 5 and after: the code.** Read [conventions.md](conventions.md), then
-[walkthrough.md](walkthrough.md). It follows one order file by file and ends
-with a list of questions an interviewer may ask, with answers.
-
-For the interview, the strongest single story is scenario 3 plus scenario 5:
-the bank refuses, the saga undoes the reservation, and when the undo itself
-fails, retries and the DLQ keep the work from being lost.

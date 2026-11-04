@@ -154,8 +154,6 @@ exactly this.
 
 ## Limitations
 
-Know these before someone else points them out.
-
 | Limitation | Effect | What a production version would do |
 |---|---|---|
 | **The Hub is in memory** | restarting the gateway loses the timelines. The real saga history is safe in the orders database; this is only a live view. | rebuild the replay from the orders service |

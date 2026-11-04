@@ -14,7 +14,7 @@ Other docs cover other angles, so this one does not repeat them:
 - Logs and traces: [observability.md](observability.md).
 
 All paths below are relative to the repository root. Money is integer EUR
-cents. The code has no comments, so function names carry the meaning.
+cents.
 
 ## 1. Map
 
@@ -503,102 +503,7 @@ publishes nothing). The gateway has no database and no use-case package for
 orders; `storefront` holds the types and the ports to other services, and
 `timeline` holds the SSE hub.
 
-## 6. Questions an interviewer may ask
-
-**Why a transactional outbox?**
-Because saving to Postgres and publishing to RabbitMQ are two systems; no
-transaction spans both. If you publish after the commit and crash, the event
-is lost. If you publish before and the commit fails, you announced something
-that did not happen. With the outbox the event is a row in the same
-transaction, and a relay publishes it afterwards. See `placing.recordPlacedOrder`
-and `outbox.Relay.RunOnce`.
-
-**Does that give exactly-once?**
-No. Delivery is at-least-once. The relay can publish a row and crash before
-marking it sent. RabbitMQ can redeliver after a consumer crash. A retry can
-duplicate a message. What each consumer gets is exactly-once effects inside
-its own database, because the inbox insert and the side effects share one
-transaction. External effects (the bank, the notification channels) are not
-covered by that: the fake bank is idempotent by key, notifications are
-at-least-once.
-
-**Why an orchestrated saga and not choreography?**
-Orders holds the state machine in one table in one file, and every failure
-path is unit-tested there. In choreography, each service would react to the
-others' events and "why is this order stuck" becomes a question across
-services. The price: orders must know the event vocabulary of billing and
-payments (ADR 3).
-
-**What does compensation do here?**
-There is one compensating action: release the reserved stock when payment
-fails. It runs in the `payment.failed` handler (`compensating.Compensate`).
-Voiding a bank authorization is not a saga step; payments does it itself,
-inside `charge`.
-
-**Why is the stock reservation a synchronous gRPC call?**
-The customer wants an immediate accept or reject, and prices come from
-inventory. Row locks in inventory prevent overselling. The trade-off is
-availability: if inventory is down, placing orders fails. The reservation and
-the order commit are not atomic (two databases), which is why the order is
-saved as `PENDING` first. Reserve and Release are idempotent per order id.
-
-**What happens if RabbitMQ is down?**
-Messaging pauses and everything else keeps working (ADR 28). Events are not
-lost: they stay in each `outbox` table and the relay retries every 500 ms.
-`Broker.Consume` reconnects with backoff (0.5 s up to 10 s), so the process
-stays up and the orders gRPC server keeps answering. `/healthz` returns `503`
-while the broker is down. An order placed during the outage is reserved,
-waits at `INVENTORY_RESERVED`, and completes on its own once RabbitMQ is back.
-`TestBrokerOutagePausesMessagingButKeepsOrdersServing` covers this by stopping
-and restarting a real RabbitMQ container.
-
-**What breaks with two gateway instances?**
-Two things. The SSE hub is in memory, so each instance only knows what it
-received. And both instances would consume from the same durable queue,
-`gateway.sse`, so RabbitMQ would split the events between them: a browser
-connected to instance A would miss events delivered to B. Fixing it needs one
-queue per instance and sticky routing, or a shared pub/sub layer
-([sse.md](sse.md), ADR 18). Also, the hub keeps only the last 500 orders and
-is lost on restart.
-
-**What stops a user from reading someone else's order?**
-`ownedOrder` in `order_handlers.go` compares the order's user with the cookie's
-user and answers 404 otherwise. The SSE endpoint uses the same check before
-subscribing. Authentication itself is simulated.
-
-**How do you handle duplicates and out-of-order events?**
-Duplicates: inbox per consumer, plus natural keys (one invoice per order,
-reservation per order id, payment per order id), plus message-id dedup in the
-SSE hub. Out of order: `orders` and `payments` both consume `invoice.generated`, so
-`payment.*` can reach orders before the invoice does. The transition table
-accepts payment events from `INVENTORY_RESERVED` too, and a late
-`invoice.generated` on a finished order is ignored (ADR 27).
-`TestSagaReachesTheSameOutcomeForEveryArrivalOrderOfInvoiceAndPayment` covers
-every ordering. Any other transition that is not in the table is logged and
-ignored.
-
-**Where can the saga get stuck?** (known limitations, from reading the code)
-
-- `payment.pending_manual` leaves the order in `INVOICED` forever. No expiry,
-  no pay-now flow (ADR 24).
-- Compensation holds a database transaction open during a gRPC call (ADR 20).
-- The payment failure switch is exposed as `PUT /api/admin/failure` to any
-  logged-in user. Fine for a demo.
-
-**What else would you change for production?**
-A retention job for the `inbox`
-and `outbox` tables (both grow without bound). Real authentication. A
-relay woken by `LISTEN/NOTIFY` or CDC instead of polling. Exponential backoff
-per message instead of three fixed tiers. A recovery sweeper for stuck sagas.
-Roles per service in Postgres instead of one shared user.
-
-**Why Go-specific choices: `internal/`, interfaces where used?**
-`internal/` makes the compiler refuse imports of one service's code by
-another, which matters in a monorepo. Interfaces are declared by the consumer
-(Go's usual rule), so the use case states what it needs and any adapter that
-fits can be injected.
-
-## 7. Suggested reading order
+## 6. Suggested reading order
 
 A first pass in about 15 files. Each one is short.
 
