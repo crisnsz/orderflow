@@ -88,9 +88,9 @@ func receiveDeadLetter(t *testing.T, connection *rabbitmqamqp.AmqpConnection, qu
 
 func queueDepth(t *testing.T, connection *rabbitmqamqp.AmqpConnection, queueName string) int {
 	t.Helper()
-	info, err := connection.Management().QueueInfo(context.Background(), queueName)
+	count, err := rabbitmq.QueueMessageCount(context.Background(), connection, queueName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return int(info.MessageCount())
+	return int(count)
 }

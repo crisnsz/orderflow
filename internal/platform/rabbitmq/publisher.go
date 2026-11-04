@@ -20,7 +20,7 @@ type Publisher struct {
 }
 
 func NewPublisher(ctx context.Context, connection *rabbitmqamqp.AmqpConnection) (*Publisher, error) {
-	if err := declareExchanges(ctx, connection.Management()); err != nil {
+	if err := DeclareExchanges(ctx, connection); err != nil {
 		return nil, err
 	}
 	publisher, err := connection.NewPublisher(ctx, nil, nil)

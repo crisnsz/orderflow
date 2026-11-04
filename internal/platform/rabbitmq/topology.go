@@ -2,12 +2,15 @@ package rabbitmq
 
 import (
 	"context"
+	"sync"
 
 	"github.com/crisnsz/orderflow/internal/platform/events"
 	"github.com/rabbitmq/rabbitmq-amqp-go-client/pkg/rabbitmqamqp"
 )
 
 const DeadLetterExchange = "orderflow.dlx"
+
+var managementRequests sync.Mutex
 
 type QueueSpec struct {
 	Name  string
@@ -18,6 +21,8 @@ type QueueSpec struct {
 func DLQName(queueName string) string { return queueName + ".dlq" }
 
 func Declare(ctx context.Context, connection *rabbitmqamqp.AmqpConnection, spec QueueSpec) error {
+	managementRequests.Lock()
+	defer managementRequests.Unlock()
 	management := connection.Management()
 	if err := declareExchanges(ctx, management); err != nil {
 		return err
@@ -77,4 +82,20 @@ func bindQueue(ctx context.Context, management *rabbitmqamqp.AmqpManagement, spe
 		}
 	}
 	return nil
+}
+
+func DeclareExchanges(ctx context.Context, connection *rabbitmqamqp.AmqpConnection) error {
+	managementRequests.Lock()
+	defer managementRequests.Unlock()
+	return declareExchanges(ctx, connection.Management())
+}
+
+func QueueMessageCount(ctx context.Context, connection *rabbitmqamqp.AmqpConnection, queueName string) (uint64, error) {
+	managementRequests.Lock()
+	defer managementRequests.Unlock()
+	info, err := connection.Management().QueueInfo(ctx, queueName)
+	if err != nil {
+		return 0, err
+	}
+	return info.MessageCount(), nil
 }
