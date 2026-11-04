@@ -188,6 +188,8 @@ Or run the same scenarios unattended: `make smoke`. Every control, five scenario
 
 ## Where to look
 
+- **Guided tour of the code** (one order, end to end, file by file):
+  [docs/walkthrough.md](docs/walkthrough.md).
 - **Code conventions** (naming, layering, use-case packages, errors, logging):
   [docs/conventions.md](docs/conventions.md).
 - **Jaeger** (http://localhost:16686): service `gateway`, operation
@@ -238,13 +240,13 @@ Or run the same scenarios unattended: `make smoke`. Every control, five scenario
 - **Compensation holds a DB transaction across a gRPC call**. Fine at this
   scale, wrong at high throughput ([ADR 20](DECISIONS.md)).
 - **Polling outbox relay** (500 ms) instead of CDC or `LISTEN/NOTIFY`.
-- **Consumers restart rather than reconnect** when the broker connection drops.
+- **A failed void is only logged**: a held authorization after a declined sale is not cleaned up automatically ([ADR 29](DECISIONS.md)).
 - **Gateway timeline is in memory** (last 500 orders), single instance.
 - **Hand-rolled migrations** (forward-only), one shared Postgres user,
   always-on trace sampling, logs only on stdout. Production notes are in
   [docs/observability.md](docs/observability.md).
 - **Not covered by automated tests**: the browser page itself (no UI tests),
-  broker-connection loss in the full stack, and load behaviour.
+  a broker outage across the whole compose stack (the integration test covers the orders service only), and load behaviour.
 
 ## Layout
 
