@@ -13,17 +13,13 @@ import (
 	dockercontainer "github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/rabbitmq"
 )
 
-const (
-	amqpContainerPort = "5672/tcp"
-	brokerStopTimeout = 10 * time.Second
-)
+const brokerStopTimeout = 10 * time.Second
 
 type RestartableRabbitMQ struct {
 	t         *testing.T
-	container *rabbitmq.RabbitMQContainer
+	container *testcontainers.DockerContainer
 	URL       string
 }
 
@@ -31,17 +27,17 @@ func StartRestartableRabbitMQ(t *testing.T) *RestartableRabbitMQ {
 	t.Helper()
 	ctx := context.Background()
 	hostPort := freeTCPPort(t)
-	broker, err := rabbitmq.Run(ctx, rabbitImage,
+	broker, err := runRabbitMQ(ctx,
 		testcontainers.WithHostConfigModifier(func(hostConfig *dockercontainer.HostConfig) {
 			hostConfig.PortBindings = network.PortMap{
-				network.MustParsePort(amqpContainerPort): {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: hostPort}},
+				network.MustParsePort(amqpPort): {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: hostPort}},
 			}
 		}))
 	if err != nil {
 		t.Fatalf("start rabbitmq container (is Docker running?): %v", err)
 	}
 	t.Cleanup(func() { _ = testcontainers.TerminateContainer(broker) })
-	return &RestartableRabbitMQ{t: t, container: broker, URL: fmt.Sprintf("amqp://guest:guest@127.0.0.1:%s/", hostPort)}
+	return &RestartableRabbitMQ{t: t, container: broker, URL: fmt.Sprintf("amqp://%s:%s@127.0.0.1:%s/", rabbitUser, rabbitPass, hostPort)}
 }
 
 func (b *RestartableRabbitMQ) Stop() {

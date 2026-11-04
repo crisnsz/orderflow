@@ -9,15 +9,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/modules/rabbitmq"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
 	postgresImage = "postgres:17.6-alpine"
 	rabbitImage   = "rabbitmq:4.3.6-management-alpine"
+	rabbitUser    = "test"
+	rabbitPass    = "test"
+	amqpPort      = "5672/tcp"
+	rabbitStartup = 60 * time.Second
 )
 
 var (
@@ -70,15 +76,32 @@ func RabbitMQ(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 	rabbitmqOnce.Do(func() {
-		container, err := rabbitmq.Run(ctx, rabbitImage)
+		container, err := runRabbitMQ(ctx)
 		if err != nil {
 			rabbitmqStartErr = err
 			return
 		}
-		rabbitmqURL, rabbitmqStartErr = container.AmqpURL(ctx)
+		rabbitmqURL, rabbitmqStartErr = amqpURL(ctx, container)
 	})
 	if rabbitmqStartErr != nil {
 		t.Fatalf("start rabbitmq container (is Docker running?): %v", rabbitmqStartErr)
 	}
 	return rabbitmqURL
+}
+
+func runRabbitMQ(ctx context.Context, customizers ...testcontainers.ContainerCustomizer) (*testcontainers.DockerContainer, error) {
+	options := []testcontainers.ContainerCustomizer{
+		testcontainers.WithEnv(map[string]string{"RABBITMQ_DEFAULT_USER": rabbitUser, "RABBITMQ_DEFAULT_PASS": rabbitPass}),
+		testcontainers.WithExposedPorts(amqpPort),
+		testcontainers.WithWaitStrategy(wait.ForLog(".*Server startup complete.*").AsRegexp().WithStartupTimeout(rabbitStartup)),
+	}
+	return testcontainers.Run(ctx, rabbitImage, append(options, customizers...)...)
+}
+
+func amqpURL(ctx context.Context, container *testcontainers.DockerContainer) (string, error) {
+	endpoint, err := container.PortEndpoint(ctx, amqpPort, "")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("amqp://%s:%s@%s/", rabbitUser, rabbitPass, endpoint), nil
 }
