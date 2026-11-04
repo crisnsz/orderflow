@@ -46,22 +46,17 @@ func seedOutbox(t *testing.T, pool *pgxpool.Pool, routingKey string, count int) 
 func TestOutboxRelayPublishesEachRowExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	pool := containers.Postgres(t)
-	connection, err := rabbitmq.Dial(ctx, containers.RabbitMQ(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = connection.Close() }()
+	connection := connect(t, containers.RabbitMQ(t))
 
 	const routingKey, total = "test.outbox.once", 25
-	channel, _ := connection.Channel()
-	if err := rabbitmq.Declare(channel, rabbitmq.QueueSpec{Name: "test.outbox.once.q", Keys: []string{routingKey}}); err != nil {
+	if err := rabbitmq.Declare(ctx, connection, rabbitmq.QueueSpec{Name: "test.outbox.once.q", Keys: []string{routingKey}}); err != nil {
 		t.Fatal(err)
 	}
 	wantMessageIDs := seedOutbox(t, pool, routingKey, total)
 
 	var relays []*outbox.Relay
 	for i := 0; i < 2; i++ {
-		publisher, err := rabbitmq.NewPublisher(connection)
+		publisher, err := rabbitmq.NewPublisher(ctx, connection)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,15 +90,8 @@ func TestOutboxRelayPublishesEachRowExactlyOnce(t *testing.T) {
 	}
 
 	deliveriesByMessageID := map[string]int{}
-	for {
-		delivery, ok, err := channel.Get("test.outbox.once.q", true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			break
-		}
-		deliveriesByMessageID[delivery.MessageId]++
+	for _, delivered := range drainQueue(t, connection, "test.outbox.once.q") {
+		deliveriesByMessageID[delivered.Properties.MessageID.(string)]++
 	}
 	if len(deliveriesByMessageID) != total {
 		t.Fatalf("broker received %d distinct messages, want %d", len(deliveriesByMessageID), total)

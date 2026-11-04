@@ -11,7 +11,7 @@ Entries are never rewritten; a changed decision gets a new entry that supersedes
 | 4 | Synchronous stock reservation over gRPC |
 | 5 | Transactional outbox for publishing |
 | 6 | Inbox table for consumer idempotency |
-| 7 | Retry with backoff through TTL queues, then a DLQ |
+| 7 | Retry with backoff through TTL queues, then a DLQ (superseded by 33) |
 | 8 | One topic exchange, one durable queue per consumer |
 | 9 | Event envelope in AMQP properties, flat JSON payload |
 | 10 | SSE (not WebSocket) for the live timeline |
@@ -37,6 +37,7 @@ Entries are never rewritten; a changed decision gets a new entry that supersedes
 | 30 | A failed release after a technical reservation failure is retried, then logged |
 | 31 | An order cancelled at reservation is still `201 Created` |
 | 32 | Outbox and inbox schemas live in the integration tests |
+| 33 | Exponential retry inside the quorum queue (RabbitMQ 4.3, AMQP 1.0) |
 
 ---
 
@@ -214,13 +215,13 @@ Entries are never rewritten; a changed decision gets a new entry that supersedes
 
 ## 21. Integration tests behind a build tag, testcontainers-go
 
-**Decision.** Files that need Docker carry `//go:build integration`. `go test ./...` stays fast and needs no Docker; `make test-integration` (and CI) run `go test -tags=integration ./...`, starting Postgres 17.6 and RabbitMQ 4.1.4 once per test binary. Each test gets its own database or uses unique queue names.
+**Decision.** Files that need Docker carry `//go:build integration`. `go test ./...` stays fast and needs no Docker; `make test-integration` (and CI) run `go test -tags=integration ./...`, starting Postgres 17.6 and RabbitMQ 4.3.6 once per test binary. Each test gets its own database or uses unique queue names.
 
 **Consequences.** The default loop is under a few seconds; the integration loop costs about a minute of container start-up. Covered: outbox exactly-once with concurrent relays and resume after publish failure, inbox duplicates and rollback, retry then DLQ, permanent failure straight to DLQ, saga persistence over real Postgres, and inventory under concurrent reservations.
 
 ## 22. Pinning policy and tooling without Homebrew
 
-**Decision.** Go modules are pinned by `go.mod`/`go.sum`. Tools are installed with `go install <pkg>@<exact version>` (golangci-lint v2.15.0, buf v1.74.0, protoc plugins). Docker images use exact tags (`postgres:17.6-alpine`, `rabbitmq:4.1.4-management-alpine`, `jaegertracing/all-in-one:1.76.0`, `golang:1.26.8-alpine`) and the runtime base is pinned by digest. GitHub Actions are pinned by full commit SHA with a version comment.
+**Decision.** Go modules are pinned by `go.mod`/`go.sum`. Tools are installed with `go install <pkg>@<exact version>` (golangci-lint v2.15.0, buf v1.74.0, protoc plugins). Docker images use exact tags (`postgres:17.6-alpine`, `rabbitmq:4.3.6-management-alpine`, `jaegertracing/all-in-one:1.76.0`, `golang:1.26.8-alpine`) and the runtime base is pinned by digest. GitHub Actions are pinned by full commit SHA with a version comment.
 
 **Consequences.** Reproducible builds. Updates are deliberate, manual work (a Dependabot or Renovate config would automate them).
 
@@ -315,3 +316,24 @@ Entries are never rewritten; a changed decision gets a new entry that supersedes
 **Decision.** The `Schema` constants in `internal/platform/outbox` and `internal/platform/inbox` were used only by integration tests, while every service defines its tables in its own migrations. They moved to `test/integration/schema_test.go`. The test module cannot import a service's `internal/adapters/postgres` migrations, so a test copy is the simplest option.
 
 **Consequences.** Production packages no longer carry test-only code. The test copy must be kept in step with the service migrations by hand.
+
+## 33. Exponential retry inside the quorum queue (RabbitMQ 4.3, AMQP 1.0)
+
+**Context.** Decision 7 needed three retry queues per consumer (`X.retry.1..3`) with fixed TTLs of 2 s, 10 s and 30 s. Five consumers meant fifteen extra queues, every new consumer added three more, and the delay was a property of the tier, not of the attempt. RabbitMQ 4.3 (April 2026) adds delayed retry to quorum queues: a message that a consumer returns as failed is held back inside the same queue and redelivered later.
+
+**Decision.** Each consumer has one durable quorum queue `X` and one DLQ `X.dlq`, also a quorum queue. The code moved from `amqp091-go` (AMQP 0.9.1) to the official `rabbitmq-amqp-go-client` (AMQP 1.0) v1.5.0, and the image to `rabbitmq:4.3.6-management-alpine`.
+
+- `X` is declared with `x-delivery-limit`, `x-delayed-retry-type: failed` and `x-delayed-retry-min/max`, and dead-letters to the direct exchange `orderflow.dlx` with routing key `X.dlq`, which is bound to `X.dlq`. Dead-lettering is `at-least-once` (with `x-overflow: reject-publish`).
+- When a handler fails, the consumer returns the message with `modified{delivery-failed=true}` and an `x-opt-delivery-time` annotation of `now + base * 2^(attempt-1)`, capped. The explicit time overrides the queue's linear default (`min(min * delivery-count, max)`). The default policy is `RetryPolicy{BaseDelay: 1s, MaxDelay: 8s, MaxAttempts: 6}`: delays of 1, 2, 4, 8 and 8 s, about 23 s in total. It is a field of `QueueSpec`.
+- `MaxAttempts` is the number of handler runs. `x-delivery-limit` is `MaxAttempts - 1`, so the broker dead-letters the message when the last allowed retry is returned, with reason `delivery-limit`. `gateway.sse` has `MaxAttempts` 0: its queue has no delivery limit and a failure is discarded to its DLQ at once.
+- `ErrPermanent` and undecodable messages are settled with `modified{delivery-failed, undeliverable-here}` and go to the DLQ without a delay.
+- Every failed return carries the annotation `x-last-error`; RabbitMQ keeps message annotations when it dead-letters, so the DLQ shows the final error next to RabbitMQ's `x-death`, `x-first-death-*` and `x-delivery-count` headers (`x-first-death-reason` is `delivery_limit` after exhausted retries and `rejected` for a permanent error). The `x-retry-count` header is gone: the count is the AMQP `delivery-count`.
+- Envelope mapping: `message-id`, `correlation-id` (order id), `subject` (event type), `creation-time`, and the application properties `traceparent` and `type` (the event type again, because a shovel that moves a message back from the DLQ goes through AMQP 0.9.1, which does not carry `subject`). A publish counts as successful only when the broker answers `accepted`; `released` (no queue matched) or `rejected` is an error and the outbox row stays unsent.
+- Reconnection is still ours (`Broker`, `ResilientPublisher`, decision 28): the client's automatic recovery is switched off so the health check and the backoff keep a single owner.
+- A consumer processes its deliveries on its own goroutine, bounded by the link credit (5). The client reads frames and answers heartbeats on separate goroutines, so a slow handler does not stall the connection. `TestSlowHandlerDoesNotStallHeartbeats` blocks a handler for three times the idle timeout.
+
+**Consequences.** One queue and one DLQ per consumer, a real exponential backoff that survives a crash or restart because the delay is stored in the replicated queue, and no republish step, so the crash window between republish and ack is gone. The cost is a new client library and a broker upgrade. The feature is new, and on 4.3 an AMQP 0.9.1 `basic.nack` with requeue does not increase the delivery count and can loop forever; the code never uses it, and `TestDeliveryCountAdvancesOnFailedReturnAndBrokerDeadLettersAtLimit` proves that a failed AMQP 1.0 return advances the count (0, 1, 2, 3) and dead-letters the message at the limit. Delaying does not help when a consumer cannot process anything at all; pausing the consumer would. Queues declared by the old code are classic queues, so a broker that still holds them must be reset (the demo stack has no RabbitMQ volume, so `make down` is enough). Moving messages back from a DLQ with the shovel plugin still works.
+
+**Alternatives.** Shared delay tiers (the NServiceBus idea): a fixed set of wait queues for the whole system (`1s, 2s, 4s, 8s`), each dead-lettering to a dispatch exchange; the queue count stays fixed but delays are limited to the tier values and every retry is a republish. It is the fallback if the native feature misbehaves. In-memory retry (MassTransit `UseMessageRetry`, Watermill `Retry`): no extra queue, but a crash resets the count and a long delay holds the delivery and its credit. The `rabbitmq-delayed-message-exchange` plugin: rejected, no longer maintained by the RabbitMQ team, stored on a single node in Mnesia.
+
+**Supersedes** decision 7.

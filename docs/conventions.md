@@ -119,7 +119,7 @@ Tests live next to the code they test and use the external package
 - `log/slog`, JSON on stdout, configured once in `telemetry.NewLogger(serviceName)`.
 - Always the context variants (`slog.InfoContext(ctx, ...)`) so `order_id`, `trace_id` and `span_id` are attached automatically. Put the order id in the context with `telemetry.WithOrderID`.
 - Messages are lower case, short, and describe the event: `"order placed"`, `"payment failed; compensating"`.
-- Attributes use snake_case keys (`order_id`, `message_id`, `amount_cents`, `retry_queue`) and the error goes under `"error"`.
+- Attributes use snake_case keys (`order_id`, `message_id`, `amount_cents`, `retry_in`) and the error goes under `"error"`.
 - Levels: `Info` for state changes in the happy path, `Warn` for handled anomalies (duplicates, retries scheduled, ignored late events), `Error` for failures that need attention (message moved to the DLQ, failed request), `Debug` for "nothing to do".
 - Never log secrets, tokens or full card data.
 

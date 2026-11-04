@@ -15,7 +15,7 @@ func Spec() rabbitmq.QueueSpec {
 		Name: "notifications.q",
 		Keys: []string{events.OrderConfirmed, events.InvoiceGenerated, events.PaymentSucceeded, events.PaymentFailed,
 			events.PaymentPendingManual, events.OrderCancelled, events.OrderCompleted},
-		RetryDelays: rabbitmq.DefaultRetryDelays,
+		Retry: rabbitmq.DefaultRetryPolicy,
 	}
 }
 

@@ -194,12 +194,12 @@ FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED
 For each row it calls `Publisher.Publish`, then sets `sent_at`, and commits.
 `SKIP LOCKED` lets two relays run without publishing the same row twice.
 
-`Publisher.Publish` is in `internal/platform/rabbitmq/rabbitmq.go`. It publishes
-to the topic exchange `orderflow.events` with the event type as routing key,
-persistent delivery, and waits for the broker's publisher confirm
-(`publishAndAwaitConfirm`). The envelope (message id, order id as correlation
-id, type, timestamp, `traceparent`) is in AMQP properties and headers; the
-body is the JSON payload (ADR 9).
+`Publisher.Publish` is in `internal/platform/rabbitmq/publisher.go`. It publishes
+over AMQP 1.0 to the topic exchange `orderflow.events` with the event type as
+routing key, durable, and waits for the broker's `accepted` outcome
+(`publishAndAwaitOutcome`). The envelope (message id, order id as correlation
+id, type as subject, creation time, `traceparent` application property) is in
+`message.go`; the body is the JSON payload (ADR 9).
 
 Reason: if the broker or the relay dies after the publish but before the
 commit, the row is sent again. That is why delivery is at-least-once and why
@@ -211,7 +211,7 @@ Files, in order:
 
 - `services/billing/internal/adapters/rabbitmq/consumer.go`: `Spec` binds
   `billing.q` to `order.confirmed` only.
-- `internal/platform/rabbitmq/rabbitmq.go`: `Consume` and `processDelivery` turn
+- `internal/platform/rabbitmq/consumer.go`: `Consume` and `processDelivery` turn
   an AMQP delivery into an `events.Message` and call the handler.
 - `services/billing/internal/invoicing/generate_invoice.go`: `HandleEvent`.
 - `services/billing/internal/domain/invoice.go`: `NewInvoice`.
@@ -364,8 +364,8 @@ inbox transaction:
 3. `Apply(InventoryReleased)`: to `CANCELLED`.
 4. Save, and queue `order.cancelled`.
 
-If `Release` fails, the whole transaction rolls back and the message goes to
-the retry queues. A side effect: `COMPENSATING` is only ever visible in
+If `Release` fails, the whole transaction rolls back and the message is retried
+with backoff. A side effect: `COMPENSATING` is only ever visible in
 `saga_log`, never as a committed `orders.state` (ADR 20).
 
 `advancing` does not import `compensating`. It declares the small
@@ -387,35 +387,44 @@ If the failure is technical (timeout, inventory down), the code calls
 all attempts fail (ADR 30). It cancels the order the same way and returns an
 error, which the gateway turns into `502`.
 
-### A consumer fails: retry queues and the DLQ
+### A consumer fails: delayed retry and the DLQ
 
-`internal/platform/rabbitmq/rabbitmq.go`, `processDelivery`,
-`chooseFailureQueue`, `republishFailedDelivery`, `Declare`.
+`internal/platform/rabbitmq/consumer.go`, `processDelivery`, `settleFailure`;
+`topology.go`, `Declare`; `retry.go`, `RetryPolicy`.
 
-For a queue `orders.q`, `Declare` creates `orders.q.retry.1`, `.retry.2`,
-`.retry.3` (message TTL 2 s, 10 s, 30 s, `DefaultRetryDelays`) and
-`orders.q.dlq`. A retry queue has no consumer: when the TTL expires,
-RabbitMQ dead-letters the message through the default exchange back into
-`orders.q`.
+For a queue `orders.q`, `Declare` creates two quorum queues: `orders.q` and
+`orders.q.dlq`. `orders.q` is declared with `x-delivery-limit`,
+`x-delayed-retry-type: failed` and a dead-letter route to the direct exchange
+`orderflow.dlx` with the key `orders.q.dlq`. There are no retry queues: RabbitMQ
+4.3 holds a failed message back inside the queue and redelivers it later.
 
 When the handler returns an error:
 
-1. If the error wraps `rabbitmq.ErrPermanent`, or the message already had 3
-   retries, it goes to `.dlq` with an `x-last-error` header.
-2. Otherwise it is republished (with publisher confirm) to
-   `.retry.<attempt+1>`; `x-retry-count` tracks the attempt.
-3. Only after the republish is confirmed is the original acked. If the
-   republish itself fails, the message is nacked and requeued.
+1. If the error wraps `rabbitmq.ErrPermanent`, or the queue has no retry policy
+   (`gateway.sse`), the delivery is rejected with `x-last-error` and goes to
+   `.dlq` at once.
+2. Otherwise the delivery is returned to the broker as failed, with the
+   annotation `x-opt-delivery-time` set to now plus `RetryPolicy.DelayAfter`
+   (`base * 2^(attempt-1)`, capped; the default is 1, 2, 4, 8, 8 s) and
+   `x-last-error`. The broker counts the failure in the AMQP `delivery-count`.
+3. When the count passes `x-delivery-limit` (`MaxAttempts - 1`), RabbitMQ
+   dead-letters the message to `.dlq`. The consumer does not republish
+   anything, so there is no window between a republish and an ack.
 
 Services mark an error permanent with their own `ErrPermanent`, converted in
 each `adapters/rabbitmq/consumer.go`. Today that means an undecodable body
-(and, in billing, an invoice that cannot be built). A panic in a handler is
-recovered and treated as a normal failure (`handleRecoveringPanic`).
+(and, in billing, an invoice that cannot be built). A message without a type is
+also permanent. A panic in a handler is recovered and treated as a normal
+failure (`handleRecoveringPanic`).
 
-`gateway.sse` has no retry queues, so an error there goes straight to its DLQ.
+Deliveries are handled one at a time on the consumer's own goroutine, with at
+most 5 in flight (the link credit). The AMQP client reads frames and answers
+heartbeats on other goroutines, so a slow handler does not drop the connection.
+
+`gateway.sse` has no retry policy, so an error there goes straight to its DLQ.
 Its handler returns `nil` on bad input, so in practice it does not fail.
 
-Draining a DLQ is manual (RabbitMQ UI). Hands-on steps are in
+Draining a DLQ is manual (RabbitMQ UI, shovel). Hands-on steps are in
 [demo-guide.md](demo-guide.md).
 
 ## 4. Building blocks in `internal/platform/`
@@ -429,8 +438,8 @@ Shared infrastructure only. No business rules.
   the side effects in the same transaction, so duplicates are skipped and
   failures roll back together. Solves duplicate delivery.
 - `rabbitmq`: a `Broker` that reconnects with backoff, the topic exchange, the publisher with
-  confirms, queue declaration with retry queues and DLQ, and the consume loop
-  with tracing, panic recovery and failure routing. Solves "every service
+  confirms, quorum queue declaration with delayed retry and DLQ, and the consume loop
+  with tracing, panic recovery and failure settlement. Solves "every service
   would otherwise write this differently".
 - `events`: event names, the single flat `Payload` struct and `Message`.
   The contract between services, and a compile-time one inside the monorepo.
@@ -601,7 +610,7 @@ A first pass in about 15 files. Each one is short.
 6. `services/orders/internal/adapters/postgres/store.go`: how `InTx`, `Once` and `Outbox` are implemented.
 7. `internal/platform/outbox/outbox.go`: insert and relay.
 8. `internal/platform/inbox/inbox.go`: 36 lines, read all of it.
-9. `internal/platform/rabbitmq/rabbitmq.go`: publisher, queue topology, retry and DLQ.
+9. `internal/platform/rabbitmq/`: `publisher.go`, `topology.go`, `consumer.go` and `retry.go`: publisher, queue topology, retry and DLQ.
 10. `services/inventory/internal/reserving/reserve_stock.go` and `internal/domain/stock.go`.
 11. `services/billing/internal/invoicing/generate_invoice.go`.
 12. `services/payments/internal/charging/handle_invoice.go` and `charge.go`.

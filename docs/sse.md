@@ -51,7 +51,7 @@ browser EventSource
 
 The gateway has its own durable queue, `gateway.sse`, bound with `#`, so it
 receives **every** event from every service. Each message is decoded and
-handed to the Hub. There are no retry queues for it: writing to memory cannot
+handed to the Hub. It has no retry policy: writing to memory cannot
 fail, and an undecodable message is logged and dropped.
 
 ### 2. The Hub

@@ -12,9 +12,9 @@ import (
 
 func Spec() rabbitmq.QueueSpec {
 	return rabbitmq.QueueSpec{
-		Name:        "orders.q",
-		Keys:        []string{events.InvoiceGenerated, events.PaymentSucceeded, events.PaymentFailed, events.PaymentPendingManual},
-		RetryDelays: rabbitmq.DefaultRetryDelays,
+		Name:  "orders.q",
+		Keys:  []string{events.InvoiceGenerated, events.PaymentSucceeded, events.PaymentFailed, events.PaymentPendingManual},
+		Retry: rabbitmq.DefaultRetryPolicy,
 	}
 }
 

@@ -5,120 +5,251 @@ package integration_test
 import (
 	"context"
 	"errors"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/crisnsz/orderflow/internal/platform/events"
 	"github.com/crisnsz/orderflow/internal/platform/rabbitmq"
 	"github.com/crisnsz/orderflow/test/containers"
-	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/rabbitmq/rabbitmq-amqp-go-client/pkg/rabbitmqamqp"
 )
 
-func waitFor(t *testing.T, what string, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
+const delayTolerance = 150 * time.Millisecond
+
+type attemptRecorder struct {
+	mu       sync.Mutex
+	attempts []time.Time
 }
 
-func startConsumer(t *testing.T, queueName, routingKey string, handle rabbitmq.Handler) (*amqp.Channel, context.CancelFunc) {
+func (r *attemptRecorder) record() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.attempts = append(r.attempts, time.Now())
+	return len(r.attempts)
+}
+
+func (r *attemptRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.attempts)
+}
+
+func (r *attemptRecorder) gaps() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var gaps []time.Duration
+	for i := 1; i < len(r.attempts); i++ {
+		gaps = append(gaps, r.attempts[i].Sub(r.attempts[i-1]))
+	}
+	return gaps
+}
+
+func startConsumer(t *testing.T, spec rabbitmq.QueueSpec, handle rabbitmq.Handler) *rabbitmqamqp.AmqpConnection {
 	t.Helper()
-	connection, err := rabbitmq.Dial(context.Background(), containers.RabbitMQ(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = connection.Close() })
-	spec := rabbitmq.QueueSpec{Name: queueName, Keys: []string{routingKey}, RetryDelays: []time.Duration{150 * time.Millisecond, 150 * time.Millisecond}}
-
-	channel, _ := connection.Channel()
-	if err := rabbitmq.Declare(channel, spec); err != nil {
-		t.Fatal(err)
-	}
+	connection := connect(t, containers.RabbitMQ(t))
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { _ = rabbitmq.Consume(ctx, connection, spec, handle) }()
+	if err := rabbitmq.Declare(ctx, connection, spec); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); _ = rabbitmq.Consume(ctx, connection, spec, handle) }()
+	t.Cleanup(func() { cancel(); <-done })
+	publishOne(t, connection, spec.Keys[0])
+	return connection
+}
 
-	publisher, err := rabbitmq.NewPublisher(connection)
+func publishOne(t *testing.T, connection *rabbitmqamqp.AmqpConnection, routingKey string) {
+	t.Helper()
+	publisher, err := rabbitmq.NewPublisher(context.Background(), connection)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(publisher.Close)
 	message, _ := events.New(routingKey, events.Payload{OrderID: "order-1", UserID: "u"})
 	if err := publisher.Publish(context.Background(), message); err != nil {
 		t.Fatal(err)
 	}
-	return channel, cancel
 }
 
-func queueDepth(channel *amqp.Channel, queueName string) int {
-	info, err := channel.QueueDeclarePassive(queueName, true, false, false, false, nil)
-	if err != nil {
-		return -1
+func assertGapsFollowBackoff(t *testing.T, got []time.Duration, policy rabbitmq.RetryPolicy) {
+	t.Helper()
+	for i, gap := range got {
+		want := policy.DelayAfter(i + 1)
+		if gap < want-delayTolerance || gap > want+delayTolerance+time.Second {
+			t.Errorf("gap before attempt %d = %v, want about %v", i+2, gap, want)
+		}
 	}
-	return info.Messages
 }
 
-func TestFailingMessageIsRetriedThenDeadLettered(t *testing.T) {
-	var calls atomic.Int64
-	channel, cancel := startConsumer(t, "test.dlq.fail.q", "test.dlq.fail", func(context.Context, events.Message) error {
-		calls.Add(1)
+func TestFailingMessageIsRetriedWithExponentialBackoffThenDeadLettered(t *testing.T) {
+	policy := rabbitmq.RetryPolicy{BaseDelay: 300 * time.Millisecond, MaxDelay: 1200 * time.Millisecond, MaxAttempts: 5}
+	spec := rabbitmq.QueueSpec{Name: "test.dlq.fail.q", Keys: []string{"test.dlq.fail"}, Retry: policy}
+	var recorder attemptRecorder
+	connection := startConsumer(t, spec, func(context.Context, events.Message) error {
+		recorder.record()
 		return errors.New("downstream unavailable")
 	})
-	defer cancel()
 
-	deadLetterQueue := rabbitmq.DLQName("test.dlq.fail.q")
-	waitFor(t, "message in DLQ", func() bool { return queueDepth(channel, deadLetterQueue) == 1 })
-	time.Sleep(600 * time.Millisecond)
-	if got := calls.Load(); got != 3 {
-		t.Errorf("handler calls = %d, want 3", got)
+	deadLetter := receiveDeadLetter(t, connection, spec.Name)
+	if got := recorder.count(); got != policy.MaxAttempts {
+		t.Errorf("handler calls = %d, want %d", got, policy.MaxAttempts)
 	}
-	deadLetter, ok, _ := channel.Get(deadLetterQueue, true)
-	if !ok {
-		t.Fatal("DLQ empty")
+	assertGapsFollowBackoff(t, recorder.gaps(), policy)
+	if *deadLetter.Properties.Subject != "test.dlq.fail" || deadLetter.Properties.CorrelationID != "order-1" {
+		t.Errorf("dead letter lost its metadata: %+v", deadLetter.Properties)
 	}
-	if deadLetter.Type != "test.dlq.fail" || deadLetter.CorrelationId != "order-1" || deadLetter.Headers["x-last-error"] == nil {
-		t.Errorf("dead letter lost its metadata: type=%q corr=%q headers=%v", deadLetter.Type, deadLetter.CorrelationId, deadLetter.Headers)
+	if deadLetter.Annotations["x-last-error"] != "downstream unavailable" {
+		t.Errorf("x-last-error = %v, annotations = %v", deadLetter.Annotations["x-last-error"], deadLetter.Annotations)
 	}
-	if queueDepth(channel, "test.dlq.fail.q") != 0 {
-		t.Error("main queue should be empty")
+	if depth := queueDepth(t, connection, spec.Name); depth != 0 {
+		t.Errorf("main queue depth = %d, want 0", depth)
 	}
 }
 
-func TestPermanentFailureSkipsRetriesAndGoesStraightToDLQ(t *testing.T) {
-	var calls atomic.Int64
-	channel, cancel := startConsumer(t, "test.dlq.perm.q", "test.dlq.perm", func(context.Context, events.Message) error {
-		calls.Add(1)
+func TestPermanentFailureGoesStraightToDLQ(t *testing.T) {
+	spec := rabbitmq.QueueSpec{Name: "test.dlq.perm.q", Keys: []string{"test.dlq.perm"}, Retry: rabbitmq.DefaultRetryPolicy}
+	var recorder attemptRecorder
+	connection := startConsumer(t, spec, func(context.Context, events.Message) error {
+		recorder.record()
 		return errors.Join(rabbitmq.ErrPermanent, errors.New("malformed body"))
 	})
-	defer cancel()
-	waitFor(t, "message in DLQ", func() bool { return queueDepth(channel, rabbitmq.DLQName("test.dlq.perm.q")) == 1 })
-	if got := calls.Load(); got != 1 {
+
+	started := time.Now()
+	deadLetter := receiveDeadLetter(t, connection, spec.Name)
+	if elapsed := time.Since(started); elapsed > rabbitmq.DefaultRetryPolicy.BaseDelay {
+		t.Errorf("permanent failure took %v to reach the DLQ, want no retry delay", elapsed)
+	}
+	if got := recorder.count(); got != 1 {
+		t.Errorf("handler calls = %d, want 1", got)
+	}
+	if deadLetter.Annotations["x-last-error"] == nil {
+		t.Errorf("dead letter has no x-last-error: %v", deadLetter.Annotations)
+	}
+}
+
+func TestQueueWithoutRetryPolicyDeadLettersOnFirstFailure(t *testing.T) {
+	spec := rabbitmq.QueueSpec{Name: "test.dlq.noretry.q", Keys: []string{"test.dlq.noretry"}}
+	var recorder attemptRecorder
+	connection := startConsumer(t, spec, func(context.Context, events.Message) error {
+		recorder.record()
+		return errors.New("boom")
+	})
+
+	receiveDeadLetter(t, connection, spec.Name)
+	if got := recorder.count(); got != 1 {
 		t.Errorf("handler calls = %d, want 1", got)
 	}
 }
 
+func TestPanickingHandlerIsRetriedLikeAnyFailure(t *testing.T) {
+	policy := rabbitmq.RetryPolicy{BaseDelay: 100 * time.Millisecond, MaxDelay: 200 * time.Millisecond, MaxAttempts: 3}
+	spec := rabbitmq.QueueSpec{Name: "test.dlq.panic.q", Keys: []string{"test.dlq.panic"}, Retry: policy}
+	var recorder attemptRecorder
+	connection := startConsumer(t, spec, func(context.Context, events.Message) error {
+		recorder.record()
+		panic("handler bug")
+	})
+
+	deadLetter := receiveDeadLetter(t, connection, spec.Name)
+	if got := recorder.count(); got != policy.MaxAttempts {
+		t.Errorf("handler calls = %d, want %d", got, policy.MaxAttempts)
+	}
+	if deadLetter.Annotations["x-last-error"] != "handler panic: handler bug" {
+		t.Errorf("x-last-error = %v", deadLetter.Annotations["x-last-error"])
+	}
+}
+
 func TestTransientFailureRecoversWithoutDLQ(t *testing.T) {
-	var calls atomic.Int64
-	channel, cancel := startConsumer(t, "test.dlq.ok.q", "test.dlq.ok", func(context.Context, events.Message) error {
-		if calls.Add(1) < 3 {
+	policy := rabbitmq.RetryPolicy{BaseDelay: 300 * time.Millisecond, MaxDelay: 1200 * time.Millisecond, MaxAttempts: 5}
+	spec := rabbitmq.QueueSpec{Name: "test.dlq.ok.q", Keys: []string{"test.dlq.ok"}, Retry: policy}
+	var recorder attemptRecorder
+	connection := startConsumer(t, spec, func(context.Context, events.Message) error {
+		if recorder.record() < 3 {
 			return errors.New("temporary")
 		}
 		return nil
 	})
-	defer cancel()
-	waitFor(t, "third attempt", func() bool { return calls.Load() == 3 })
-	time.Sleep(600 * time.Millisecond)
-	if calls.Load() != 3 {
-		t.Errorf("handler calls = %d, want 3", calls.Load())
+
+	waitFor(t, "third attempt", func() bool { return recorder.count() == 3 })
+	time.Sleep(time.Second)
+	if got := recorder.count(); got != 3 {
+		t.Errorf("handler calls = %d, want 3", got)
 	}
-	if depth := queueDepth(channel, rabbitmq.DLQName("test.dlq.ok.q")); depth != 0 {
-		t.Errorf("DLQ depth = %d, want 0", depth)
+	assertGapsFollowBackoff(t, recorder.gaps(), policy)
+	for _, queueName := range []string{spec.Name, rabbitmq.DLQName(spec.Name)} {
+		if depth := queueDepth(t, connection, queueName); depth != 0 {
+			t.Errorf("%s depth = %d, want 0", queueName, depth)
+		}
 	}
-	if depth := queueDepth(channel, "test.dlq.ok.q"); depth != 0 {
-		t.Errorf("main queue depth = %d, want 0", depth)
+}
+
+func TestDeliveryCountAdvancesOnFailedReturnAndBrokerDeadLettersAtLimit(t *testing.T) {
+	policy := rabbitmq.RetryPolicy{BaseDelay: 50 * time.Millisecond, MaxDelay: 50 * time.Millisecond, MaxAttempts: 4}
+	spec := rabbitmq.QueueSpec{Name: "test.dlq.limit.q", Keys: []string{"test.dlq.limit"}, Retry: policy}
+	connection := connect(t, containers.RabbitMQ(t))
+	if err := rabbitmq.Declare(context.Background(), connection, spec); err != nil {
+		t.Fatal(err)
 	}
+	publishOne(t, connection, spec.Keys[0])
+
+	consumer, err := connection.NewConsumer(context.Background(), spec.Name, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = consumer.Close(context.Background()) }()
+	var deliveryCounts []uint32
+	for {
+		receiveCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		delivery, err := consumer.Receive(receiveCtx)
+		cancel()
+		if err != nil {
+			break
+		}
+		deliveryCounts = append(deliveryCounts, delivery.Message().Header.DeliveryCount)
+		if err := delivery.DelayRetry(context.Background(), 50*time.Millisecond, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wantCounts := []uint32{0, 1, 2, 3}
+	if len(deliveryCounts) != len(wantCounts) {
+		t.Fatalf("delivery counts = %v, want %v", deliveryCounts, wantCounts)
+	}
+	for i := range wantCounts {
+		if deliveryCounts[i] != wantCounts[i] {
+			t.Fatalf("delivery counts = %v, want %v", deliveryCounts, wantCounts)
+		}
+	}
+	receiveDeadLetter(t, connection, spec.Name)
+}
+
+func TestSlowHandlerDoesNotStallHeartbeats(t *testing.T) {
+	const idleTimeout = 2 * time.Second
+	const handlerBlockTime = 3 * idleTimeout
+	connection := connect(t, containers.RabbitMQ(t), rabbitmq.WithIdleTimeout(idleTimeout))
+	spec := rabbitmq.QueueSpec{Name: "test.slow.handler.q", Keys: []string{"test.slow.handler"}, Retry: rabbitmq.DefaultRetryPolicy}
+	if err := rabbitmq.Declare(context.Background(), connection, spec); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var handled sync.WaitGroup
+	handled.Add(1)
+	go func() {
+		defer close(done)
+		_ = rabbitmq.Consume(ctx, connection, spec, func(context.Context, events.Message) error {
+			defer handled.Done()
+			time.Sleep(handlerBlockTime)
+			return nil
+		})
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	publishOne(t, connection, spec.Keys[0])
+
+	handled.Wait()
+	if _, open := connection.State().(*rabbitmqamqp.StateOpen); !open {
+		t.Fatalf("connection state = %T after a handler blocked for %v with idle timeout %v", connection.State(), handlerBlockTime, idleTimeout)
+	}
+	waitFor(t, "slow message settled", func() bool { return queueDepth(t, connection, spec.Name) == 0 })
 }

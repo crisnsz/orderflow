@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/url"
 	"sync"
 	"time"
 
+	"github.com/Azure/go-amqp"
 	"github.com/crisnsz/orderflow/internal/platform/events"
-	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/rabbitmq/rabbitmq-amqp-go-client/pkg/rabbitmqamqp"
 )
 
 const (
@@ -21,24 +23,43 @@ const (
 var ErrBrokerUnavailable = errors.New("rabbitmq connection is not established")
 
 type Broker struct {
-	url string
+	address     string
+	idleTimeout time.Duration
 
 	mu         sync.Mutex
-	connection *amqp.Connection
+	connection *rabbitmqamqp.AmqpConnection
 }
 
-func NewBroker(url string) *Broker { return &Broker{url: url} }
+type BrokerOption func(*Broker)
 
-func (b *Broker) Connect(ctx context.Context) (*amqp.Connection, error) {
+func WithIdleTimeout(idleTimeout time.Duration) BrokerOption {
+	return func(b *Broker) { b.idleTimeout = idleTimeout }
+}
+
+func NewBroker(address string, options ...BrokerOption) *Broker {
+	broker := &Broker{address: address}
+	for _, option := range options {
+		option(broker)
+	}
+	return broker
+}
+
+func (b *Broker) Connect(ctx context.Context) (*rabbitmqamqp.AmqpConnection, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.connection != nil && !b.connection.IsClosed() {
+	if b.connection != nil && isOpen(b.connection) {
 		return b.connection, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	connection, err := amqp.DialConfig(b.url, amqp.Config{Dial: amqp.DefaultDial(brokerConnectTimeout)})
+	dialCtx, cancel := context.WithTimeout(ctx, brokerConnectTimeout)
+	defer cancel()
+	options, err := b.connectionOptions()
+	if err != nil {
+		return nil, err
+	}
+	connection, err := rabbitmqamqp.Dial(dialCtx, b.address, options)
 	if err != nil {
 		return nil, err
 	}
@@ -47,22 +68,45 @@ func (b *Broker) Connect(ctx context.Context) (*amqp.Connection, error) {
 	return connection, nil
 }
 
+func (b *Broker) connectionOptions() (*rabbitmqamqp.AmqpConnOptions, error) {
+	parsed, err := url.Parse(b.address)
+	if err != nil {
+		return nil, err
+	}
+	options := &rabbitmqamqp.AmqpConnOptions{
+		IdleTimeout:           b.idleTimeout,
+		RecoveryConfiguration: &rabbitmqamqp.RecoveryConfiguration{ActiveRecovery: false},
+	}
+	if parsed.User != nil {
+		password, _ := parsed.User.Password()
+		options.SASLType = amqp.SASLTypePlain(parsed.User.Username(), password)
+	}
+	return options, nil
+}
+
+func isOpen(connection *rabbitmqamqp.AmqpConnection) bool {
+	_, open := connection.State().(*rabbitmqamqp.StateOpen)
+	return open
+}
+
 func (b *Broker) Check(context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.connection == nil || b.connection.IsClosed() {
+	if b.connection == nil || !isOpen(b.connection) {
 		return ErrBrokerUnavailable
 	}
 	return nil
 }
 
 func (b *Broker) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), brokerConnectTimeout)
+	defer cancel()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.connection == nil {
 		return nil
 	}
-	return b.connection.Close()
+	return b.connection.Close(ctx)
 }
 
 func (b *Broker) Consume(ctx context.Context, spec QueueSpec, handle Handler) error {
@@ -113,7 +157,7 @@ func (p *ResilientPublisher) Publish(ctx context.Context, message events.Message
 		if err != nil {
 			return err
 		}
-		if p.publisher, err = NewPublisher(connection); err != nil {
+		if p.publisher, err = NewPublisher(ctx, connection); err != nil {
 			return err
 		}
 	}

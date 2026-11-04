@@ -17,7 +17,7 @@ import (
 
 const (
 	postgresImage = "postgres:17.6-alpine"
-	rabbitImage   = "rabbitmq:4.1.4-management-alpine"
+	rabbitImage   = "rabbitmq:4.3.6-management-alpine"
 )
 
 var (

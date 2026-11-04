@@ -30,7 +30,7 @@ services:
       retries: 60
 
   rabbitmq:
-    image: rabbitmq:4.1.4-management-alpine
+    image: rabbitmq:4.3.6-management-alpine
     environment:
       RABBITMQ_DEFAULT_USER: orderflow
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-orderflow-demo-password}

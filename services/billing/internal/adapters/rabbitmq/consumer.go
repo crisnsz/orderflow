@@ -11,7 +11,7 @@ import (
 )
 
 func Spec() rabbitmq.QueueSpec {
-	return rabbitmq.QueueSpec{Name: "billing.q", Keys: []string{events.OrderConfirmed}, RetryDelays: rabbitmq.DefaultRetryDelays}
+	return rabbitmq.QueueSpec{Name: "billing.q", Keys: []string{events.OrderConfirmed}, Retry: rabbitmq.DefaultRetryPolicy}
 }
 
 func Handler(service *invoicing.Service) rabbitmq.Handler {

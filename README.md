@@ -197,8 +197,7 @@ Or run the same scenarios unattended: `make smoke`. Every control, five scenario
 - **Jaeger** (http://localhost:16686): service `gateway`, operation
   `POST /api/orders`. One trace covers HTTP, gRPC, the outbox relay, the broker
   and all consumers, including the compensation call.
-- **RabbitMQ UI** → Exchanges → `orderflow.events`; Queues → `*.q`, `*.retry.N`,
-  `*.dlq`.
+- **RabbitMQ UI** → Exchanges → `orderflow.events`; Queues → `*.q`, `*.dlq`.
 - **Logs**: every line is JSON with `service`, `order_id`, `trace_id`, `span_id`.
 
   ```sh
@@ -218,9 +217,9 @@ Or run the same scenarios unattended: `make smoke`. Every control, five scenario
   semantics; inventory reservation rules; the autopay decision; invoice
   tax maths; notification planning; session tokens; the SSE hub.
 - **Integration tests** (`-tags=integration`, testcontainers: Postgres 17 and
-  RabbitMQ 4): the outbox relay publishes each row exactly once (with two
+  RabbitMQ 4.3): the outbox relay publishes each row exactly once (with two
   concurrent relays) and resumes after a broker failure; the inbox drops
-  duplicates and rolls back with the handler; failing messages are retried and
+  duplicates and rolls back with the handler; failing messages are retried with exponential backoff and
   then dead-lettered; permanent failures skip retries; the saga persists
   correctly in Postgres; concurrent reservations never oversell.
 - **Smoke test** (`scripts/smoke.sh`): against the compose stack: login, order
@@ -252,7 +251,7 @@ Or run the same scenarios unattended: `make smoke`. Every control, five scenario
 
 ## Keywords
 
-Go (Golang), microservices, event-driven architecture, distributed systems, gRPC, Protocol Buffers (buf), RabbitMQ (topic exchange, retry queues, dead-letter queue), saga pattern (orchestration, compensation), transactional outbox, idempotent consumers (inbox), at-least-once delivery, hexagonal architecture (ports and adapters), domain-driven design, PostgreSQL (pgx), OpenTelemetry, distributed tracing, Jaeger, structured logging (slog), Server-Sent Events (SSE), Docker, Docker Compose, testcontainers, integration testing, golangci-lint, GitHub Actions CI, architecture decision records (ADRs).
+Go (Golang), microservices, event-driven architecture, distributed systems, gRPC, Protocol Buffers (buf), RabbitMQ (topic exchange, quorum queues, delayed retry with exponential backoff, dead-letter queue, AMQP 1.0), saga pattern (orchestration, compensation), transactional outbox, idempotent consumers (inbox), at-least-once delivery, hexagonal architecture (ports and adapters), domain-driven design, PostgreSQL (pgx), OpenTelemetry, distributed tracing, Jaeger, structured logging (slog), Server-Sent Events (SSE), Docker, Docker Compose, testcontainers, integration testing, golangci-lint, GitHub Actions CI, architecture decision records (ADRs).
 
 ## Layout
 

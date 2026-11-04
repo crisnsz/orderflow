@@ -45,10 +45,10 @@ Example line:
 
 - Over HTTP/gRPC: `order_id` is put in the context as soon as the order exists
   (`telemetry.WithOrderID`), so every later log line in that call has it.
-- Over RabbitMQ: the AMQP `correlation_id` is the order id. The consumer wrapper
+- Over RabbitMQ: the AMQP `correlation-id` is the order id. The consumer wrapper
   reads it and calls `WithOrderID` before the handler runs, so a consumer
   needs no extra code to log with the right `order_id`.
-- Trace context: the producer injects a W3C `traceparent` header; the consumer
+- Trace context: the producer injects a W3C `traceparent` application property; the consumer
   extracts it. The transactional outbox stores the `traceparent` next to the
   event, so the relay (which publishes later, from another goroutine) continues
   the **original** trace instead of starting a new one. Result: one trace spans

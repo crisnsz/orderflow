@@ -203,34 +203,40 @@ docker compose stop inventory
 docker compose unpause payments
 ```
 
-Then open RabbitMQ → **Queues** and watch `orders.q.retry.1`, `.retry.2` and
-`.retry.3`.
+Then open RabbitMQ → **Queues** and watch `orders.q` and `orders.q.dlq`.
 
 **See:** orders tries to compensate, but `Release` cannot reach inventory, so
-the handler fails. The message moves to `orders.q.retry.1`, then `.retry.2`,
-then `.retry.3`. Meanwhile the order stays at `INVOICED`. Then:
+the handler fails. RabbitMQ keeps the message in `orders.q` and redelivers it
+after 1 s, 2 s, 4 s, 8 s and 8 s. `orders.q` shows one message the whole time
+and `orders.q.dlq` stays at 0. Meanwhile the order stays at `INVOICED`. Then:
 
 ```sh
 docker compose start inventory
 ```
 
-The next retry succeeds, and the order ends `CANCELLED`. Measured on this stack:
-the message reached `retry.2` at 15 s, `retry.3` at 30 s and the DLQ at
-65 s.
+The next retry succeeds, and the order ends `CANCELLED`. Measured on this stack
+with inventory kept down: the first failure came 5 s after unpausing payments,
+the retries were scheduled 1, 2, 4, 8 and 8 s apart, and the message reached
+`orders.q.dlq` 33 s after the first failure. Each attempt also waits for the
+gRPC timeout while inventory is down, so the gaps between log lines are longer
+than the delays.
 
-If you leave inventory stopped for longer than all the retries (about 45 s plus
-the gRPC timeouts), the message lands in `orders.q.dlq` and the order stays
-stuck. That is what a dead-letter queue is for: a human inspects it, fixes the
-cause, and moves the message back to `orders.q` from the **Move messages**
-section of the `orders.q.dlq` page.
+If you leave inventory stopped for longer than all the retries (about 40 s),
+the message lands in `orders.q.dlq` and the order stays stuck. That is what a
+dead-letter queue is for: a human inspects it, fixes the cause, and moves the
+message back to `orders.q` from the **Move messages** section of the
+`orders.q.dlq` page. Measured: after starting inventory and moving the message,
+the order ended `CANCELLED` 2 s later.
 
 The orders logs show each attempt:
 
 ```text
-WARN message handling failed; retry scheduled  attempt=1  orders.q.retry.1
-WARN message handling failed; retry scheduled  attempt=2  orders.q.retry.2
-WARN message handling failed; retry scheduled  attempt=3  orders.q.retry.3
-WARN order cancelled after compensation
+WARN message handling failed; retry scheduled  attempt=1  retry_in=1s
+WARN message handling failed; retry scheduled  attempt=2  retry_in=2s
+WARN message handling failed; retry scheduled  attempt=3  retry_in=4s
+WARN message handling failed; retry scheduled  attempt=4  retry_in=8s
+WARN message handling failed; retry scheduled  attempt=5  retry_in=8s
+ERROR message moved to DLQ  reason="delivery limit reached"
 ```
 
 **Why the state stays `INVOICED` and not `COMPENSATING`:** the state change and
@@ -266,47 +272,49 @@ The live bindings, as shown in Exchanges → `orderflow.events` → Bindings:
 | `notifications.q` | notifications | every event except `order.placed` |
 | `gateway.sse` | gateway | `#`, which means **everything** (it feeds the timeline) |
 
-Each consumer queue has a set of companions:
+Every consumer queue is a **quorum queue** and has exactly one companion,
+`<name>.dlq`, a quorum queue that keeps dead letters for a human. Dead letters
+reach it through the direct exchange `orderflow.dlx`, which routes the key
+`<name>.dlq` to that queue. There are no retry queues.
 
-| Queue | Purpose | Message TTL | When the TTL expires |
-|---|---|---|---|
-| `<name>.retry.1` | first retry | 2 s | goes back to `<name>` |
-| `<name>.retry.2` | second retry | 10 s | goes back to `<name>` |
-| `<name>.retry.3` | third retry | 30 s | goes back to `<name>` |
-| `<name>.dlq` | dead letters, kept for a human | none | stays |
-
-`gateway.sse` has a DLQ but no retry queues. Its handler only writes to memory,
-so a failure there is not worth retrying.
+`gateway.sse` has a DLQ but no retries. Its handler only writes to memory, so a
+failure there is not worth retrying and goes straight to the DLQ.
 
 ### How a retry works
 
-Nobody consumes from the retry queues. They are waiting rooms:
+RabbitMQ 4.3 can hold a failed message back **inside the same quorum queue**:
 
 ```text
-orders.q ──handler fails──▶ orders.q.retry.1 (sits 2 s)
-                                   │ TTL expires: dead-lettered
-                                   ▼
-orders.q ◀── default exchange, routing key "orders.q"
+orders.q ──handler fails──▶ returned to orders.q, hidden for 1 s, 2 s, 4 s, 8 s...
+   │
+   └── delivery limit reached, or permanent error
+          ▼
+orderflow.dlx ──key "orders.q.dlq"──▶ orders.q.dlq
 ```
 
-1. The handler returns an error. The consumer publishes a copy to the next retry
-   queue, with headers `x-retry-count` and `x-last-error`, and then acks the
-   original.
-2. The retry queue has `x-message-ttl`. When it expires, RabbitMQ
-   **dead-letters** the message to `x-dead-letter-exchange: ""` (the default
-   exchange) with `x-dead-letter-routing-key: orders.q`, which delivers it
-   straight back to the main queue.
-3. After the third retry fails, or right away when the error is marked
-   **permanent** (`ErrPermanent`), the message goes to `<name>.dlq`.
+1. The handler returns an error. The consumer answers the broker over AMQP 1.0
+   with "failed, redeliver", an explicit delivery time (now plus `base * 2^(n-1)`,
+   capped) and the annotation `x-last-error`. The default policy is base 1 s,
+   cap 8 s, 6 attempts (`rabbitmq.DefaultRetryPolicy`).
+2. The queue was declared with `x-delayed-retry-type: failed`, so the broker
+   does not hand the message out again before that time. It counts each failed
+   return in the `delivery-count`.
+3. The queue has `x-delivery-limit: 5`. When the sixth attempt fails,
+   RabbitMQ **dead-letters** the message to `orderflow.dlx` with the key
+   `orders.q.dlq`. A **permanent** error (`ErrPermanent`, for example an
+   undecodable message) is rejected at once and takes the same route without
+   any delay.
 
-You can check these arguments in Queues → click `orders.q.retry.1` → Features.
+You can check these arguments in Queues → click `orders.q` → Features.
 
 ### What to look at in the UI
 
 - **Queues**: the message count per queue. During scenario 5 you see the message
-  move through the retry queues.
+  stay in `<name>` while it is retried and end up in the DLQ.
 - **Queues → `<name>.dlq` → Get messages**: read a dead letter, including
-  `x-last-error` (why it failed) and `x-retry-count`.
+  `x-last-error` (why it failed), `x-delivery-count` (how many times it was
+  delivered) and `x-first-death-reason` (`delivery_limit` after exhausted
+  retries, `rejected` for a permanent error).
 - **Exchanges → `orderflow.events`**: message rates and the bindings table above.
 
 ### Why each message is safe to process twice

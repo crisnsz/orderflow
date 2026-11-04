@@ -29,6 +29,7 @@ const (
 	outageQueue          = "test.outage.q"
 	outageObservationFor = 4 * time.Second
 	brokerRecoveryWait   = 60 * time.Second
+	drainAttemptTimeout  = 10 * time.Second
 )
 
 type safeBuffer struct {
@@ -142,21 +143,27 @@ func queueOutageEvent(t *testing.T, pool *pgxpool.Pool) string {
 
 func drainMessageIDs(brokerURL string) map[string]bool {
 	messageIDs := map[string]bool{}
-	connection, err := rabbitmq.Dial(context.Background(), brokerURL)
+	ctx, cancel := context.WithTimeout(context.Background(), drainAttemptTimeout)
+	defer cancel()
+	broker := rabbitmq.NewBroker(brokerURL)
+	connection, err := broker.Connect(ctx)
 	if err != nil {
 		return messageIDs
 	}
-	defer func() { _ = connection.Close() }()
-	channel, err := connection.Channel()
+	defer func() { _ = broker.Close() }()
+	consumer, err := connection.NewConsumer(ctx, outageQueue, nil)
 	if err != nil {
 		return messageIDs
 	}
 	for {
-		delivery, ok, err := channel.Get(outageQueue, true)
-		if err != nil || !ok {
+		receiveCtx, receiveCancel := context.WithTimeout(ctx, drainIdleTimeout)
+		delivery, err := consumer.Receive(receiveCtx)
+		receiveCancel()
+		if err != nil {
 			return messageIDs
 		}
-		messageIDs[delivery.MessageId] = true
+		_ = delivery.Accept(ctx)
+		messageIDs[delivery.Message().Properties.MessageID.(string)] = true
 	}
 }
 
@@ -168,15 +175,10 @@ func TestBrokerOutagePausesMessagingButKeepsOrdersServing(t *testing.T) {
 	waitFor(t, "orders gRPC to answer", func() bool { return process.listOrders(t) == nil })
 	waitFor(t, "orders to report the broker connected", func() bool { return process.healthStatus() == http.StatusOK })
 
-	setupConnection, err := rabbitmq.Dial(context.Background(), broker.URL)
-	if err != nil {
+	setupConnection := connect(t, broker.URL)
+	if err := rabbitmq.Declare(context.Background(), setupConnection, rabbitmq.QueueSpec{Name: outageQueue, Keys: []string{outageRoutingKey}}); err != nil {
 		t.Fatal(err)
 	}
-	setupChannel, _ := setupConnection.Channel()
-	if err := rabbitmq.Declare(setupChannel, rabbitmq.QueueSpec{Name: outageQueue, Keys: []string{outageRoutingKey}}); err != nil {
-		t.Fatal(err)
-	}
-	_ = setupConnection.Close()
 
 	broker.Stop()
 	duringOutage := queueOutageEvent(t, pool)

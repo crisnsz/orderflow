@@ -46,7 +46,7 @@ a concrete scenario in [section 4](#4-a-guided-session).
 | Go 1.26 | The programming language | All six services and the tests are Go | `go.mod` | `go version`. Only needed to run tests and lint, not to run the stack |
 | Docker and Docker Compose | Runs programs in isolated containers; Compose starts many together | One command starts nine containers: six services plus Postgres, RabbitMQ and Jaeger | `docker-compose.yml`, `Dockerfile` | `docker compose ps`, `docker compose logs <service>` |
 | PostgreSQL 17 | Relational database | One server, one database per service, so services do not share tables | `docker-compose.yml`, `docker/postgres/init.sh` | Not published to the host. Inside the network only |
-| RabbitMQ 4.1 | Message broker: services publish events, others receive them | Lets services work without calling each other. Holds messages while a service is down | `docker-compose.yml`, plugins in `docker/rabbitmq/enabled_plugins` (shovel, for **Move messages**), topology declared in `internal/platform/rabbitmq` | UI at http://localhost:15672, user `orderflow`, password `orderflow-demo-password` (a demo value from the repo docs) |
+| RabbitMQ 4.3 | Message broker: services publish events, others receive them | Lets services work without calling each other. Holds messages while a service is down | `docker-compose.yml`, plugins in `docker/rabbitmq/enabled_plugins` (shovel, for **Move messages**), topology declared in `internal/platform/rabbitmq` | UI at http://localhost:15672, user `orderflow`, password `orderflow-demo-password` (a demo value from the repo docs) |
 | gRPC and protobuf | Typed remote calls between services; `.proto` files define them | The one synchronous call: `orders` to `inventory` (`Reserve`, `Release`), plus gateway to orders and inventory | `proto/`, generated code in `gen/` | No UI. Calls show as spans in Jaeger |
 | buf and protoc plugins | `buf` lints `.proto` files and runs the Go code generators `protoc-gen-go` and `protoc-gen-go-grpc` | Turns `.proto` files into the Go code in `gen/`, and CI checks that `gen/` is up to date | `buf.yaml`, `buf.gen.yaml` | `make proto` |
 | OpenTelemetry | A standard for emitting traces from code | Each service records spans and passes a trace id along HTTP, gRPC and RabbitMQ messages | `internal/platform/telemetry/trace.go` | Nothing to open. It sends data to Jaeger |
@@ -305,31 +305,37 @@ What happens next:
 - payments declines the card and publishes `payment.failed`.
 - orders tries to release the stock, the gRPC call to inventory fails, and the
   database transaction rolls back.
-- The message moves to `orders.q.retry.1`, waits 2 s, returns to `orders.q`,
-  fails again, moves to `retry.2` (10 s), then `retry.3` (30 s).
+- RabbitMQ keeps the message inside `orders.q` and hands it back after a delay
+  that doubles on each failure: 1 s, 2 s, 4 s, then 8 s twice. The handler runs
+  up to 6 times. Each run also waits for the gRPC timeout while inventory is
+  down.
 - The order stays `INVOICED` the whole time.
 
-**RabbitMQ.** In **Queues**, watch `orders.q.retry.1`, `.retry.2`, `.retry.3`.
-Each shows one message in Ready while it waits. Tip: set the table to refresh
-every 5 seconds (top right of the page). Measured on this stack: the message
-was in `retry.2` at 15 s, in `retry.3` at 30 s and in `orders.q.dlq` at 65 s.
+**RabbitMQ.** There are no retry queues. In **Queues**, watch `orders.q` (one
+message, which flips between Ready and Unacked) and `orders.q.dlq` (0 until the
+retries run out). Tip: set the table to refresh every 5 seconds (top right of
+the page). Measured on this stack: the first failure came about 5 s after
+unpausing payments, the retries were scheduled 1, 2, 4, 8 and 8 s apart, and
+the message reached `orders.q.dlq` 33 s after the first failure.
 
 **Logs.** `docker compose logs orders` shows, per attempt, `payment failed;
 compensating` followed by `message handling failed; retry scheduled` with the
-fields `attempt`, `retry_queue` and `error`.
+fields `attempt`, `retry_in` and `error`.
 
 Now choose:
 
 - **Recover.** Run `docker compose start inventory` within about 30 seconds of
   stopping it. The next retry succeeds, the log shows `order cancelled after
-  compensation`, and the order ends `CANCELLED`. The delay is the retry queue
-  wait, not slowness.
-- **Let it die.** Leave inventory down for about a minute. After the fourth
+  compensation`, and the order ends `CANCELLED`. The delay is the backoff
+  delay, not slowness.
+- **Let it die.** Leave inventory down for about 40 seconds. After the sixth
   failure orders logs `message moved to DLQ` at ERROR level and the message
   sits in `orders.q.dlq`. In the RabbitMQ UI open **Queues**, click
   `orders.q.dlq`, open **Get messages**, press **Get Message(s)**. You see the
   payload and the headers `x-last-error` (why it failed, for example
-  `release stock: rpc error: code = Unavailable ...`) and `x-retry-count` (4).
+  `release stock: rpc error: code = Unavailable ...`), `x-delivery-count` (6),
+  and `x-first-death-reason: delivery_limit`, which says RabbitMQ gave up after
+  the retries.
   The order stays `INVOICED` until a person sends the message back. Start
   inventory, then use the **Move messages** section of the `orders.q.dlq` page
   with destination `orders.q`. The order ends `CANCELLED` a few seconds later.
@@ -338,9 +344,9 @@ Finally set the switch back to **off** in the page.
 
 **Jaeger.** Take the `trace_id` from the orders log lines and open it. The
 retries keep the trace context, so they appear in the same trace: in a run with
-four failed attempts and one replay, the trace had seven `consume
-payment.failed` spans (five in orders, one each in notifications and the
-gateway) and six `inventory.v1.InventoryService/Release` calls.
+six failed attempts and one replay, the trace had nine `consume
+payment.failed` spans (seven in orders, one each in notifications and the
+gateway) and eight `inventory.v1.InventoryService/Release` calls.
 
 One detail: after inventory restarts, orders may need one or two more failed
 attempts because its gRPC connection still points at the old container
@@ -463,7 +469,7 @@ orderflow/
 ```
 
 `internal/platform/` holds the reusable parts: `outbox`, `inbox`, `rabbitmq`
-(publisher, consumer, retry and DLQ topology), `telemetry` (logs and traces),
+(publisher, consumer, queue and DLQ topology, retry policy), `telemetry` (logs and traces),
 `events` (the event vocabulary), `database`, `config`, `health`.
 
 One service expanded, `services/orders/`:
@@ -525,12 +531,12 @@ receive the same message twice. Each consumer records the message id in an
 `inbox` table in the same transaction as its work. A duplicate finds the id and
 is skipped. Reason: processing twice would invoice or charge twice.
 
-**Retry queues and DLQ (ADR 7, 8).** When a handler fails, the message goes to
-a retry queue that holds it for 2, 10 and then 30 seconds, then returns to the
-main queue. After the third retry, or on an error marked permanent, it goes to
-a dead-letter queue (`.dlq`) for a human to inspect. Reason: temporary failures
-heal themselves without a hot retry loop, and a poison message cannot block the
-queue forever. You watched this in scenario 5.
+**Delayed retry and DLQ (ADR 8, 33).** When a handler fails, the consumer
+returns the message to its own queue with a delay that doubles each time (1, 2,
+4, 8 s). After the sixth failure, or at once on an error marked permanent, it
+goes to a dead-letter queue (`.dlq`) for a human to inspect. Reason: temporary
+failures heal themselves without a hot retry loop, a poison message cannot block
+the queue forever, and each consumer needs only one queue plus its DLQ. You watched this in scenario 5.
 
 **SSE for the live timeline (ADR 10, 18).** The browser opens
 `GET /api/orders/{id}/events` and the server pushes each event as it arrives.
