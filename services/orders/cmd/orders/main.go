@@ -59,15 +59,9 @@ func run(healthAddr string) error {
 		return err
 	}
 
-	brokerConn, err := rabbitmq.Dial(ctx, config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = brokerConn.Close() }()
-	publisher, err := rabbitmq.NewPublisher(brokerConn)
-	if err != nil {
-		return err
-	}
+	broker := rabbitmq.NewBroker(config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
+	defer func() { _ = broker.Close() }()
+	publisher := rabbitmq.NewResilientPublisher(broker)
 
 	inventoryClient, inventoryConn, err := inventory.Dial(config.String("INVENTORY_ADDR", "localhost:9002"))
 	if err != nil {
@@ -79,7 +73,7 @@ func run(healthAddr string) error {
 	placingOrders := placing.NewService(store, inventoryClient)
 	advancingSaga := advancing.NewService(store, compensating.NewService(inventoryClient))
 	fetchingOrders := fetching.NewService(store)
-	health.Serve(ctx, healthAddr, func(checkCtx context.Context) error { return pool.Ping(checkCtx) })
+	health.Serve(ctx, healthAddr, func(checkCtx context.Context) error { return pool.Ping(checkCtx) }, broker.Check)
 
 	grpcServer := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler()))
 	ordersv1.RegisterOrdersServiceServer(grpcServer, grpcadapter.NewServer(placingOrders, fetchingOrders))
@@ -93,7 +87,7 @@ func run(healthAddr string) error {
 		(&outbox.Relay{Pool: pool, Publisher: publisher}).Run(groupCtx)
 		return nil
 	})
-	group.Go(func() error { return rabbitmq.Consume(groupCtx, brokerConn, mq.Spec(), mq.Handler(advancingSaga)) })
+	group.Go(func() error { return broker.Consume(groupCtx, mq.Spec(), mq.Handler(advancingSaga)) })
 	group.Go(func() error {
 		go func() { <-groupCtx.Done(); grpcServer.GracefulStop() }()
 		slog.Info("orders listening", "addr", listener.Addr().String())

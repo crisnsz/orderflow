@@ -48,14 +48,11 @@ func run(healthAddr string) error {
 	if err := postgres.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	brokerConn, err := rabbitmq.Dial(ctx, config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = brokerConn.Close() }()
-	health.Serve(ctx, healthAddr, func(checkCtx context.Context) error { return pool.Ping(checkCtx) })
+	broker := rabbitmq.NewBroker(config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
+	defer func() { _ = broker.Close() }()
+	health.Serve(ctx, healthAddr, func(checkCtx context.Context) error { return pool.Ping(checkCtx) }, broker.Check)
 
 	notifications := notifying.NewService(postgres.NewStore(pool), channels.All()...)
 	slog.Info("notifications started")
-	return rabbitmq.Consume(ctx, brokerConn, mq.Spec(), mq.Handler(notifications))
+	return broker.Consume(ctx, mq.Spec(), mq.Handler(notifications))
 }

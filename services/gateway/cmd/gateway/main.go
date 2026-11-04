@@ -69,19 +69,11 @@ func run(healthAddr string) error {
 	}
 	defer func() { _ = catalogConn.Close() }()
 
-	brokerConn, err := rabbitmq.Dial(ctx, config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = brokerConn.Close() }()
+	broker := rabbitmq.NewBroker(config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
+	defer func() { _ = broker.Close() }()
 
 	hub := timeline.NewHub(maxTrackedOrders)
-	health.Serve(ctx, healthAddr, func(context.Context) error {
-		if brokerConn.IsClosed() {
-			return errors.New("rabbitmq connection closed")
-		}
-		return nil
-	})
+	health.Serve(ctx, healthAddr, broker.Check)
 
 	server := &nethttp.Server{
 		Addr: config.String("HTTP_ADDR", ":8080"),
@@ -93,7 +85,7 @@ func run(healthAddr string) error {
 	}
 
 	group, groupCtx := errgroup.WithContext(ctx)
-	group.Go(func() error { return mq.Run(groupCtx, brokerConn, hub) })
+	group.Go(func() error { return mq.Run(groupCtx, broker, hub) })
 	group.Go(func() error {
 		go func() {
 			<-groupCtx.Done()

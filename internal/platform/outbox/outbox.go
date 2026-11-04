@@ -11,19 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const Schema = `CREATE TABLE IF NOT EXISTS outbox (
-	id          bigserial   PRIMARY KEY,
-	message_id  uuid        NOT NULL UNIQUE,
-	routing_key text        NOT NULL,
-	order_id    text        NOT NULL,
-	body        jsonb       NOT NULL,
-	traceparent text        NOT NULL DEFAULT '',
-	occurred_at timestamptz NOT NULL,
-	created_at  timestamptz NOT NULL DEFAULT now(),
-	sent_at     timestamptz
-);
-CREATE INDEX IF NOT EXISTS outbox_unsent_idx ON outbox(id) WHERE sent_at IS NULL;`
-
 func Insert(ctx context.Context, tx pgx.Tx, message events.Message) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO outbox(message_id, routing_key, order_id, body, traceparent, occurred_at)

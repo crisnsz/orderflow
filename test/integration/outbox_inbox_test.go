@@ -22,7 +22,7 @@ import (
 func seedOutbox(t *testing.T, pool *pgxpool.Pool, routingKey string, count int) []string {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, outbox.Schema); err != nil {
+	if _, err := pool.Exec(ctx, outboxSchema); err != nil {
 		t.Fatal(err)
 	}
 	var messageIDs []string
@@ -163,7 +163,7 @@ func TestOutboxRelayResumesAfterPublishFailure(t *testing.T) {
 func TestInboxDropsDuplicates(t *testing.T) {
 	ctx := context.Background()
 	pool := containers.Postgres(t)
-	if _, err := pool.Exec(ctx, inbox.Schema+`; CREATE TABLE effects(n int)`); err != nil {
+	if _, err := pool.Exec(ctx, inboxSchema+`; CREATE TABLE effects(n int)`); err != nil {
 		t.Fatal(err)
 	}
 	effect := func(tx pgx.Tx) error { _, err := tx.Exec(ctx, `INSERT INTO effects VALUES (1)`); return err }
@@ -188,7 +188,7 @@ func TestInboxDropsDuplicates(t *testing.T) {
 func TestInboxRollsBackWhenTheHandlerFails(t *testing.T) {
 	ctx := context.Background()
 	pool := containers.Postgres(t)
-	if _, err := pool.Exec(ctx, inbox.Schema+`; CREATE TABLE effects(n int)`); err != nil {
+	if _, err := pool.Exec(ctx, inboxSchema+`; CREATE TABLE effects(n int)`); err != nil {
 		t.Fatal(err)
 	}
 	const id = "6f0f4f64-8d57-4a52-9d3f-2f5e1e0a0002"
@@ -216,7 +216,7 @@ func TestInboxRollsBackWhenTheHandlerFails(t *testing.T) {
 func TestInboxConcurrentDuplicatesRunOnce(t *testing.T) {
 	ctx := context.Background()
 	pool := containers.Postgres(t)
-	if _, err := pool.Exec(ctx, inbox.Schema); err != nil {
+	if _, err := pool.Exec(ctx, inboxSchema); err != nil {
 		t.Fatal(err)
 	}
 	var runs atomic.Int64

@@ -75,6 +75,8 @@ func NewPublisher(connection *amqp.Connection) (*Publisher, error) {
 	return &Publisher{channel: channel, confirms: confirms}, nil
 }
 
+func (p *Publisher) Close() { _ = p.channel.Close() }
+
 func (p *Publisher) Publish(ctx context.Context, message events.Message) error {
 	ctx, span := telemetry.Tracer().Start(ctx, "publish "+message.Type,
 		trace.WithSpanKind(trace.SpanKindProducer),
@@ -195,6 +197,7 @@ func Consume(ctx context.Context, connection *amqp.Connection, spec QueueSpec, h
 	if err != nil {
 		return err
 	}
+	defer republisher.Close()
 	deliveries, err := channel.Consume(spec.Name, "", false, false, false, false, nil)
 	if err != nil {
 		return err

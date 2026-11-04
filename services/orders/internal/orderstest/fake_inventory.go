@@ -9,10 +9,11 @@ import (
 const unitPriceCents = 1000
 
 type FakeInventory struct {
-	ReserveErr   error
-	ReleaseErr   error
-	ReleaseCalls int
-	Released     int
+	ReserveErr      error
+	ReleaseErr      error
+	ReleaseFailures int
+	ReleaseCalls    int
+	Released        int
 }
 
 var _ domain.Inventory = (*FakeInventory)(nil)
@@ -31,7 +32,7 @@ func (f *FakeInventory) Reserve(_ context.Context, _ string, items []domain.Item
 
 func (f *FakeInventory) Release(context.Context, string) error {
 	f.ReleaseCalls++
-	if f.ReleaseErr != nil {
+	if f.ReleaseErr != nil && (f.ReleaseFailures == 0 || f.ReleaseCalls <= f.ReleaseFailures) {
 		return f.ReleaseErr
 	}
 	f.Released++

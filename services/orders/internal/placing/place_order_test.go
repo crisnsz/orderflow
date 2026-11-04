@@ -58,3 +58,34 @@ func TestPlaceOrderValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestTechnicalReservationFailureReleasesStockAndCancels(t *testing.T) {
+	tests := []struct {
+		name         string
+		releaseErr   error
+		failures     int
+		wantReleases int
+	}{
+		{"release succeeds first time", nil, 0, 1},
+		{"release is retried after a transient failure", errors.New("inventory down"), 2, 3},
+		{"release is attempted a bounded number of times", errors.New("inventory down"), 0, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repository := orderstest.NewInMemoryRepository()
+			inventory := &orderstest.FakeInventory{
+				ReserveErr: errors.New("connection reset"), ReleaseErr: tt.releaseErr, ReleaseFailures: tt.failures}
+			_, err := placing.NewService(repository, inventory).
+				PlaceOrder(context.Background(), "u1", []domain.Item{{SKU: "KB-01", Quantity: 1}})
+			if err == nil {
+				t.Fatal("want the reservation error returned to the caller")
+			}
+			if inventory.ReleaseCalls != tt.wantReleases {
+				t.Errorf("release calls = %d, want %d", inventory.ReleaseCalls, tt.wantReleases)
+			}
+			if published := repository.PublishedEventTypes(); published[len(published)-1] != events.OrderCancelled {
+				t.Errorf("last event = %v, want order.cancelled", published)
+			}
+		})
+	}
+}

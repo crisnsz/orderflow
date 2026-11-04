@@ -37,6 +37,7 @@ var transitions = map[State]map[Trigger]State{
 	},
 	InventoryReserved: {
 		InvoiceGenerated: Invoiced,
+		PaymentSucceeded: Paid,
 		PaymentFailed:    Compensating,
 	},
 	Invoiced: {

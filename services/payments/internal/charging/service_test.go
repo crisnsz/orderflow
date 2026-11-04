@@ -43,8 +43,8 @@ func (s *fakeStore) Once(_ context.Context, consumer, messageID string, work fun
 }
 
 type fakeBank struct {
-	authorizeErr, saleErr error
-	calls                 []string
+	authorizeErr, saleErr, voidErr error
+	calls                          []string
 }
 
 func (b *fakeBank) Authorize(context.Context, string, string, int64) (string, error) {
@@ -57,7 +57,7 @@ func (b *fakeBank) Sale(context.Context, string, string, int64) (string, error) 
 }
 func (b *fakeBank) Void(context.Context, string, string) error {
 	b.calls = append(b.calls, "void")
-	return nil
+	return b.voidErr
 }
 
 func invoiceGenerated(t *testing.T) events.Message {
@@ -88,6 +88,8 @@ func TestInvoiceHandling(t *testing.T) {
 		{"no card asks for manual payment", nil, &fakeBank{}, events.PaymentPendingManual, nil, false},
 		{"declined authorization fails the payment without a void", savedCard(true), &fakeBank{authorizeErr: decline}, events.PaymentFailed, []string{"auth"}, false},
 		{"failed sale voids the authorization and fails the payment", savedCard(true), &fakeBank{saleErr: decline}, events.PaymentFailed, []string{"auth", "sale", "void"}, false},
+		{"declined sale with failed void still fails the payment", savedCard(true), &fakeBank{saleErr: decline, voidErr: errors.New("bank unreachable")}, events.PaymentFailed, []string{"auth", "sale", "void"}, false},
+		{"technical sale error with failed void is retried", savedCard(true), &fakeBank{saleErr: errors.New("timeout"), voidErr: errors.New("bank unreachable")}, "", []string{"auth", "sale", "void"}, true},
 		{"technical bank error is retried, not published", savedCard(true), &fakeBank{authorizeErr: errors.New("timeout")}, "", []string{"auth"}, true},
 	}
 	for _, tt := range tests {

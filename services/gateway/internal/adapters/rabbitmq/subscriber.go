@@ -8,12 +8,11 @@ import (
 	"github.com/crisnsz/orderflow/internal/platform/events"
 	"github.com/crisnsz/orderflow/internal/platform/rabbitmq"
 	"github.com/crisnsz/orderflow/services/gateway/internal/timeline"
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-func Run(ctx context.Context, connection *amqp.Connection, hub *timeline.Hub) error {
+func Run(ctx context.Context, broker *rabbitmq.Broker, hub *timeline.Hub) error {
 	spec := rabbitmq.QueueSpec{Name: "gateway.sse", Keys: []string{"#"}}
-	return rabbitmq.Consume(ctx, connection, spec, func(ctx context.Context, message events.Message) error {
+	return broker.Consume(ctx, spec, func(ctx context.Context, message events.Message) error {
 		payload, err := message.Decode()
 		if err != nil {
 			slog.WarnContext(ctx, "dropping undecodable event", "type", message.Type, "error", err)

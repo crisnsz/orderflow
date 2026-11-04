@@ -146,7 +146,7 @@ byId("place").onclick = async () => {
   byId("place-msg").textContent = "Placing...";
   try {
     const order = await fetchJson("/api/orders", { method: "POST", body: JSON.stringify({ items }) });
-    byId("place-msg").textContent = "Order " + shortOrderId(order.id) + " is " + order.state;
+    byId("place-msg").textContent = "Order " + shortOrderId(order.id) + " is " + order.state + (order.cancel_reason ? ": " + order.cancel_reason : "");
     followOrder(order);
     loadProducts();
     loadOrders();

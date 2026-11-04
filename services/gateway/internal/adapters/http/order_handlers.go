@@ -37,6 +37,7 @@ func (s *Server) placeOrder(w nethttp.ResponseWriter, r *nethttp.Request, user d
 		return
 	}
 	slog.InfoContext(telemetry.WithOrderID(r.Context(), order.ID), "order placed through gateway", "user_id", user.ID, "state", order.State)
+	w.Header().Set("Location", "/api/orders/"+order.ID)
 	writeJSON(w, nethttp.StatusCreated, order)
 }
 

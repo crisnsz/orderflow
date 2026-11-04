@@ -140,3 +140,50 @@ func TestMalformedEventIsPermanentFailure(t *testing.T) {
 		t.Fatalf("err = %v, want ErrPermanent", err)
 	}
 }
+
+func TestSagaReachesTheSameOutcomeForEveryArrivalOrderOfInvoiceAndPayment(t *testing.T) {
+	tests := []struct {
+		name      string
+		arrivals  []string
+		wantState domain.State
+		wantEvent string
+	}{
+		{"invoice then payment", []string{events.InvoiceGenerated, events.PaymentSucceeded}, domain.Completed, events.OrderCompleted},
+		{"payment then invoice", []string{events.PaymentSucceeded, events.InvoiceGenerated}, domain.Completed, events.OrderCompleted},
+		{"payment then invoice then duplicates", []string{events.PaymentSucceeded, events.InvoiceGenerated, events.PaymentSucceeded, events.InvoiceGenerated}, domain.Completed, events.OrderCompleted},
+		{"invoice then manual payment", []string{events.InvoiceGenerated, events.PaymentPendingManual}, domain.Invoiced, ""},
+		{"manual payment then invoice", []string{events.PaymentPendingManual, events.InvoiceGenerated}, domain.Invoiced, ""},
+		{"invoice then failure", []string{events.InvoiceGenerated, events.PaymentFailed}, domain.Cancelled, events.OrderCancelled},
+		{"failure then invoice", []string{events.PaymentFailed, events.InvoiceGenerated}, domain.Cancelled, events.OrderCancelled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newSagaFixture(t)
+			for _, eventType := range tt.arrivals {
+				if err := fixture.saga.HandleEvent(context.Background(), fixture.event(t, eventType, "declined")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stored := fixture.storedOrder(t); stored.State != tt.wantState {
+				t.Fatalf("state = %s, want %s", stored.State, tt.wantState)
+			}
+			published := fixture.repository.PublishedEventTypes()
+			if tt.wantEvent != "" && published[len(published)-1] != tt.wantEvent {
+				t.Errorf("events = %v, want last %s", published, tt.wantEvent)
+			}
+			if completions := countOf(published, events.OrderCompleted); completions > 1 {
+				t.Errorf("order.completed published %d times", completions)
+			}
+		})
+	}
+}
+
+func countOf(eventTypes []string, wanted string) int {
+	count := 0
+	for _, eventType := range eventTypes {
+		if eventType == wanted {
+			count++
+		}
+	}
+	return count
+}

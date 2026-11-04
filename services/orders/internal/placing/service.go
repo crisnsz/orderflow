@@ -9,7 +9,12 @@ import (
 
 var ErrInvalid = errors.New("invalid request")
 
-const orderCurrency = "EUR"
+const (
+	orderCurrency = "EUR"
+
+	releaseMaxAttempts = 3
+	releaseRetryDelay  = 100 * time.Millisecond
+)
 
 type Service struct {
 	repository domain.Repository

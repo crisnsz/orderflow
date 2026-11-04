@@ -59,16 +59,10 @@ func run(healthAddr string) error {
 	if err := postgres.Migrate(ctx, pool); err != nil {
 		return err
 	}
-	brokerConn, err := rabbitmq.Dial(ctx, config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = brokerConn.Close() }()
-	publisher, err := rabbitmq.NewPublisher(brokerConn)
-	if err != nil {
-		return err
-	}
-	health.Serve(ctx, healthAddr, func(checkCtx context.Context) error { return pool.Ping(checkCtx) })
+	broker := rabbitmq.NewBroker(config.String("RABBITMQ_URL", "amqp://orderflow:orderflow@localhost:5672/"))
+	defer func() { _ = broker.Close() }()
+	publisher := rabbitmq.NewResilientPublisher(broker)
+	health.Serve(ctx, healthAddr, func(checkCtx context.Context) error { return pool.Ping(checkCtx) }, broker.Check)
 
 	failureSwitch := bank.NewSwitch(os.Getenv("PAYMENTS_FAIL_STAGE"))
 	store := postgres.NewStore(pool)
@@ -81,7 +75,7 @@ func run(healthAddr string) error {
 	}
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { (&outbox.Relay{Pool: pool, Publisher: publisher}).Run(groupCtx); return nil })
-	group.Go(func() error { return rabbitmq.Consume(groupCtx, brokerConn, mq.Spec(), mq.Handler(service)) })
+	group.Go(func() error { return broker.Consume(groupCtx, mq.Spec(), mq.Handler(service)) })
 	group.Go(func() error {
 		go func() {
 			<-groupCtx.Done()

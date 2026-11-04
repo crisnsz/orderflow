@@ -27,9 +27,16 @@ Entries are never rewritten; a changed decision gets a new entry that supersedes
 | 20 | Compensation calls inventory inside the consumer transaction |
 | 21 | Integration tests behind a build tag, testcontainers-go |
 | 22 | Pinning policy and tooling without Homebrew |
-| 23 | Consumers do not reconnect; the container restarts them |
+| 23 | Consumers do not reconnect; the container restarts them (superseded by 28) |
 | 24 | Manual payment is not implemented (`payment.pending_manual` is terminal for the demo) |
 | 25 | Payments owns cards, notifications owns channel preferences |
+| 26 | Use-case packages and `internal/platform` |
+| 27 | `payment.succeeded` is accepted before the order is invoiced |
+| 28 | A broker outage pauses messaging; the service keeps running |
+| 29 | A declined sale stays a decline when the void fails |
+| 30 | A failed release after a technical reservation failure is retried, then logged |
+| 31 | An order cancelled at reservation is still `201 Created` |
+| 32 | Outbox and inbox schemas live in the integration tests |
 
 ---
 
@@ -256,3 +263,55 @@ Entries are never rewritten; a changed decision gets a new entry that supersedes
 - *Keeping `pkg/`*: harmless, but it signals "importable library" for code that is private to this system.
 
 **Consequences.** More, smaller packages, and a little wiring in each `main.go`. In exchange the package name documents the use case (`placing.NewService`), each package can be read and tested alone, and the cycle-free rule is enforced by the compiler. A service with a single use case (billing, payments, notifications) has one package; splitting it further would add nothing. Prior art: [CodelyTV/go-hexagonal_http_api-course](https://github.com/CodelyTV/go-hexagonal_http_api-course) (packages named `creating`, `increasing`) and [ThreeDotsLabs/wild-workouts-go-ddd-example](https://github.com/ThreeDotsLabs/wild-workouts-go-ddd-example) (domain, app and adapters per service, with `internal/` for private code).
+
+## 27. `payment.succeeded` is accepted before the order is invoiced
+
+**Context.** `orders.q` and `payments.q` both consume `invoice.generated`. If orders' handling is retried, payments can already charge and publish `payment.succeeded` while the order is still `INVENTORY_RESERVED`. The transition table had no entry for it, `advancing` logged and dropped the event, the inbox marked it processed, and the order ended `INVOICED` forever.
+
+**Decision.** The table allows `PaymentSucceeded` from `INVENTORY_RESERVED` straight to `PAID`, and the handler then completes the order as usual. A late `invoice.generated` finds a completed order and is ignored as invalid for that state. `payment.failed` already had the same early entry, and `payment.pending_manual` only logs, so every arrival order of `invoice.generated` and `payment.*` converges on the same final state. Duplicates are still absorbed by the inbox.
+
+**Consequences.** The history of such an order skips `INVOICED`. The rule is justified because payments only charges an invoice that exists, so the event is proof of the invoice.
+
+**Alternatives.** Fail the early event so it is retried until `invoice.generated` has been applied. It keeps the history linear but depends on the retry budget (three tiers, about 45 s) and sends the order to the DLQ if orders is down longer than that.
+
+## 28. A broker outage pauses messaging; the service keeps running
+
+**Context.** The consumer, the outbox relay and the gRPC or HTTP server shared one errgroup. When the RabbitMQ connection dropped, `Consume` returned an error and the process exited, so orders could not be placed during a broker outage (decision 23). Orders, billing, payments, notifications and the gateway all had the pattern.
+
+**Decision.** `rabbitmq.Broker` owns the connection and dials lazily with a 5 s timeout. `Broker.Consume` loops: connect, consume, on any failure wait with exponential backoff (0.5 s up to 10 s) and try again; it only returns when the context ends. `ResilientPublisher` implements the outbox `Publisher` on top of the broker and discards its channel after any error. The relay needs no change: while the broker is away the publish fails and the rows stay unsent, and they are published once it is back. Services start without waiting for the broker. `/healthz` of every service that uses the broker now also fails while the connection is closed, so it reports the broker state without stopping the process.
+
+**Consequences.** gRPC and HTTP keep answering during an outage; orders placed meanwhile are persisted and their events are delivered later, in order. The in-flight message is redelivered and the inbox makes that safe. A failing broker is logged at every relay tick and reconnect attempt. The Docker health status flips to unhealthy during an outage, which does not restart the container. Tested with `TestBrokerOutagePausesMessagingButKeepsOrdersServing`, which stops and starts a real RabbitMQ container under the real orders binary.
+
+**Supersedes** decision 23.
+
+## 29. A declined sale stays a decline when the void fails
+
+**Context.** After `Authorize` succeeds and `Sale` fails, `charge` voids the authorization. If the void failed too, only the void error was returned, so the decline was lost: the message was retried instead of publishing `payment.failed`, and the customer waited with a held authorization and no outcome.
+
+**Decision.** When the sale error is a decline (`ErrDeclined`), the outcome is final: `charge` still returns the decline, the payment is recorded as `FAILED` with its authorization reference, `payment.failed` is published and orders compensates. The failed void is logged at error level with the authorization reference so it can be voided by hand. A technical sale error with a failed void is still retried, because the outcome is unknown.
+
+**Consequences.** The customer always gets an outcome. The held authorization is not cleaned up automatically; it expires at the bank, and the stored reference allows a manual void. A sweeper that retries voids for failed payments would close the gap.
+
+## 30. A failed release after a technical reservation failure is retried, then logged
+
+**Context.** When `Reserve` fails for a technical reason (timeout, connection reset), the stock may or may not have been reserved. `placing` released best-effort and ignored the error, so a failed release could leak stock silently.
+
+**Decision.** Release is attempted up to three times, 100 ms apart (it is idempotent by order id). If every attempt fails, an error is logged with the order id and the order is cancelled and the reservation error returned as before.
+
+**Consequences.** A short inventory blip no longer leaks stock. A longer outage still can, but never silently: the log names the order to release. Making this fully safe needs a persisted compensation task or a sweeper, which this demo does not have.
+
+## 31. An order cancelled at reservation is still `201 Created`
+
+**Context.** When inventory rejects a reservation, `POST /api/orders` creates an order that is immediately `CANCELLED` and returned.
+
+**Decision.** Keep `201`. The order exists, is stored, has events and is readable at `GET /api/orders/{id}`; the rejection is a business outcome of the saga, not an invalid request. The response now carries a `Location` header and the body already holds `state`, `cancel_reason` and `history`. The demo page shows the state and the reason.
+
+**Consequences.** Clients must read `state` to know whether the order went through, as they must anyway for the later saga states. A `4xx` would suggest nothing was created, would hide an order that appears in the list and in events, and would break `curl -f` in `scripts/smoke.sh`.
+
+**Alternatives.** `422 Unprocessable Content` with the order in the body: more explicit, but it treats a persisted resource as a failed request.
+
+## 32. Outbox and inbox schemas live in the integration tests
+
+**Decision.** The `Schema` constants in `internal/platform/outbox` and `internal/platform/inbox` were used only by integration tests, while every service defines its tables in its own migrations. They moved to `test/integration/schema_test.go`. The test module cannot import a service's `internal/adapters/postgres` migrations, so a test copy is the simplest option.
+
+**Consequences.** Production packages no longer carry test-only code. The test copy must be kept in step with the service migrations by hand.

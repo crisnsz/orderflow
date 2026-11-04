@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/crisnsz/orderflow/internal/platform/events"
 	"github.com/crisnsz/orderflow/internal/platform/telemetry"
@@ -89,7 +90,7 @@ func (s *Service) cancelAfterReservationFailure(ctx context.Context, orderID str
 	reason := "inventory rejected the order: " + reserveErr.Error()
 	if !rejected {
 		reason = "inventory unavailable"
-		_ = s.inventory.Release(ctx, orderID)
+		s.releaseAfterTechnicalFailure(ctx, orderID)
 	}
 	if err := s.cancelBeforeReservation(ctx, orderID, reason); err != nil {
 		return nil, err
@@ -116,4 +117,27 @@ func (s *Service) cancelBeforeReservation(ctx context.Context, orderID, reason s
 		return domain.QueueEvent(ctx, tx, events.OrderCancelled, events.Payload{
 			OrderID: order.ID, UserID: order.UserID, Reason: reason})
 	})
+}
+
+func (s *Service) releaseAfterTechnicalFailure(ctx context.Context, orderID string) {
+	var releaseErr error
+	for attempt := 1; attempt <= releaseMaxAttempts; attempt++ {
+		if releaseErr = s.inventory.Release(ctx, orderID); releaseErr == nil {
+			return
+		}
+		slog.WarnContext(ctx, "release after reservation failure failed", "attempt", attempt, "error", releaseErr)
+		if attempt < releaseMaxAttempts && !sleepOrDone(ctx, releaseRetryDelay) {
+			break
+		}
+	}
+	slog.ErrorContext(ctx, "stock may remain reserved; release it manually", "order_id", orderID, "error", releaseErr)
+}
+
+func sleepOrDone(ctx context.Context, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
 }
