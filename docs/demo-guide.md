@@ -105,7 +105,7 @@ saga state.
 | Payment succeeded | `payment.succeeded` | payments |
 | Payment failed | `payment.failed` | payments |
 | Waiting for manual payment | `payment.pending_manual` | payments |
-| Order cancelled (stock released) | `order.cancelled` | orders |
+| Order cancelled | `order.cancelled` | orders |
 | Order completed | `order.completed` | orders |
 
 ### Your orders
@@ -132,7 +132,7 @@ different service, and they talk only through events on RabbitMQ.
 
 **Do:** log out, log in as Bob, order anything.
 
-**See:** the timeline stops at "Waiting for manual payment". The chip stays
+**See:** the timeline stops at "Waiting for manual payment". The chip stops
 at `INVOICED`.
 
 **Why it matters:** payments never charges a card without consent. It publishes
@@ -181,7 +181,7 @@ transaction that spans services. Instead, each completed step has a
 **Do:** order 5 monitors (there are 2).
 
 **See:** the order is created and immediately `CANCELLED`, with the reason
-`insufficient stock: MON-01 requested 5, available 2`.
+`inventory rejected the reservation: insufficient stock: MON-01 requested 5, available 2`.
 
 **Why it matters:** the stock check is a **synchronous** gRPC call (`Reserve`)
 made while the order is placed, before any money is involved. Nothing was
@@ -189,16 +189,18 @@ reserved, so there is nothing to compensate.
 
 ### Scenario 5: a service is down, the message is retried
 
-This one is run from a terminal, because you need to stop a container at the
-right moment.
+This one is run partly from a terminal. The order must be placed while
+inventory is up, and inventory must be down when the payment fails. Pausing
+payments first removes the race.
 
 **Do:**
 
 ```sh
-# with the failure switch on "sale" and logged in on the page as anyone:
-#   1. place an order on the page
-#   2. right away:
+# 1. in the page: log in as anyone, set the failure switch to "sale"
+docker compose pause payments
+# 2. in the page: place an order (the timeline stops at "Invoice generated")
 docker compose stop inventory
+docker compose unpause payments
 ```
 
 Then open RabbitMQ → **Queues** and watch `orders.q.retry.1`, `.retry.2` and
@@ -213,11 +215,14 @@ docker compose start inventory
 ```
 
 The next retry succeeds, and the order ends `CANCELLED`. Measured on this stack:
-three retries, then success about 35 s after inventory came back.
+the message reached `retry.2` at 15 s, `retry.3` at 30 s and the DLQ at
+65 s.
 
 If you leave inventory stopped for longer than all the retries (about 45 s plus
 the gRPC timeouts), the message lands in `orders.q.dlq` and the order stays
-stuck. That is what a dead-letter queue is for: a human inspects it.
+stuck. That is what a dead-letter queue is for: a human inspects it, fixes the
+cause, and moves the message back to `orders.q` from the **Move messages**
+section of the `orders.q.dlq` page.
 
 The orders logs show each attempt:
 

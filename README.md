@@ -19,6 +19,8 @@ and end-to-end tracing.
 > transactions, the broker, the saga, retries, tracing) is real. See
 > [Trade-offs](#trade-offs-and-known-gaps).
 
+**New here?** Start with [docs/start-here.md](docs/start-here.md): what to install, what to click, what each tool is for.
+
 ## Architecture
 
 ```mermaid
@@ -247,6 +249,10 @@ Or run the same scenarios unattended: `make smoke`. Every control, five scenario
   [docs/observability.md](docs/observability.md).
 - **Not covered by automated tests**: the browser page itself (no UI tests),
   a broker outage across the whole compose stack (the integration test covers the orders service only), and load behaviour.
+
+## Keywords
+
+Go (Golang), microservices, event-driven architecture, distributed systems, gRPC, Protocol Buffers (buf), RabbitMQ (topic exchange, retry queues, dead-letter queue), saga pattern (orchestration, compensation), transactional outbox, idempotent consumers (inbox), at-least-once delivery, hexagonal architecture (ports and adapters), domain-driven design, PostgreSQL (pgx), OpenTelemetry, distributed tracing, Jaeger, structured logging (slog), Server-Sent Events (SSE), Docker, Docker Compose, testcontainers, integration testing, golangci-lint, GitHub Actions CI, architecture decision records (ADRs).
 
 ## Layout
 
