@@ -177,14 +177,27 @@ const EVENT_LABELS = {
   "payment.succeeded": ["Payment succeeded", "good"],
   "payment.failed": ["Payment failed", "bad"],
   "payment.pending_manual": ["Waiting for manual payment (no autopay consent)", "warn"],
-  "order.cancelled": ["Order cancelled (stock released)", "bad"],
+  "order.cancelled": ["Order cancelled", "bad"],
   "order.completed": ["Order completed", "good"],
 };
 
 const STATE_AFTER_EVENT = {
+  "order.confirmed": "INVENTORY_RESERVED",
+  "invoice.generated": "INVOICED",
+  "payment.succeeded": "PAID",
+  "payment.failed": "COMPENSATING",
   "order.completed": "COMPLETED",
   "order.cancelled": "CANCELLED",
-  "payment.failed": "COMPENSATING",
+};
+
+const STATE_PROGRESS = {
+  PENDING: 0,
+  INVENTORY_RESERVED: 1,
+  INVOICED: 2,
+  PAID: 3,
+  COMPENSATING: 4,
+  COMPLETED: 5,
+  CANCELLED: 5,
 };
 
 function describeEventData(event) {
@@ -210,7 +223,7 @@ function appendTimelineEntry(event) {
 function addEvent(event) {
   appendTimelineEntry(event);
   const newState = STATE_AFTER_EVENT[event.type];
-  if (newState) showState(newState);
+  if (newState && STATE_PROGRESS[newState] > STATE_PROGRESS[byId("state").textContent]) showState(newState);
 }
 
 function showState(state) {
@@ -233,7 +246,10 @@ function followOrder(order) {
       if (shownEventIds.has(event.id)) return;
       shownEventIds.add(event.id);
       addEvent(event);
-      if (eventType === "order.completed" || eventType === "order.cancelled") loadOrders();
+      if (eventType === "order.completed" || eventType === "order.cancelled") {
+        loadOrders();
+        loadProducts();
+      }
     });
   }
 }

@@ -40,7 +40,7 @@ func placeOrderRequest(t *testing.T, placed storefront.Order) *httptest.Response
 }
 
 func TestPlaceOrderCancelledAtReservationIsCreatedWithStateReasonAndLocation(t *testing.T) {
-	placed := storefront.Order{ID: "o-1", UserID: "u-alice", State: "CANCELLED", CancelReason: "inventory rejected the order: insufficient stock"}
+	placed := storefront.Order{ID: "o-1", UserID: "u-alice", State: "CANCELLED", CancelReason: "inventory rejected the reservation: insufficient stock"}
 	recorder := placeOrderRequest(t, placed)
 
 	if recorder.Code != nethttp.StatusCreated {

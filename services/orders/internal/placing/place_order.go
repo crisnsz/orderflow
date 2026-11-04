@@ -87,7 +87,7 @@ func (s *Service) confirmReservedOrder(ctx context.Context, orderID string, pric
 
 func (s *Service) cancelAfterReservationFailure(ctx context.Context, orderID string, reserveErr error) (*domain.Order, error) {
 	rejected := errors.Is(reserveErr, domain.ErrRejected)
-	reason := "inventory rejected the order: " + reserveErr.Error()
+	reason := reserveErr.Error()
 	if !rejected {
 		reason = "inventory unavailable"
 		s.releaseAfterTechnicalFailure(ctx, orderID)
